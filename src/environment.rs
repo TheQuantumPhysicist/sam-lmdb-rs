@@ -543,7 +543,7 @@ impl Drop for Environment {
     fn drop(&mut self) {
         // This is a solution for the issue where, very rarely, closing an environment
         // from a thread where a transaction was executed causes a SIGSEGV.
-        // This issue was proven and tested in mintlayer-core under rare circumstances
+        // This issue was proven and tested under rare circumstances
         std::thread::scope(|s| {
             s.spawn(move || unsafe { ffi::mdb_env_close(self.env) })
                 .join()

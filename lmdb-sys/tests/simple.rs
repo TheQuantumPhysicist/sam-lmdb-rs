@@ -1,7 +1,8 @@
 use lmdb_sys::*;
 
 use std::ffi::{c_void, CString};
-use std::fs::File;
+use std::fs::{self, File};
+use std::path::Path;
 use std::ptr;
 
 // https://github.com/victorporof/lmdb/blob/mdb.master/libraries/liblmdb/moz-test.c
@@ -45,7 +46,20 @@ fn get_file_fd(file: &File) -> std::os::unix::io::RawFd {
     file.as_raw_fd()
 }
 
-fn test_simple(env_path: &str) {
+fn test_simple(fixture_dir: &str) {
+    // Work on a scratch copy of the fixture database under the system temp
+    // directory, so that running the test never modifies the fixture files
+    // tracked in git.
+    let scratch = std::env::temp_dir().join(format!("lmdb-sys-simple-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&scratch);
+    fs::create_dir_all(&scratch).unwrap();
+    fs::copy(
+        Path::new(fixture_dir).join("data.mdb"),
+        scratch.join("data.mdb"),
+    )
+    .unwrap();
+    let env_path = scratch.to_str().unwrap();
+
     let mut env: *mut MDB_env = ptr::null_mut();
     let mut dbi: MDB_dbi = 0;
     let mut key = MDB_val {
@@ -86,7 +100,7 @@ fn test_simple(env_path: &str) {
         E!(mdb_txn_commit(txn));
     }
 
-    let file = File::create("./tests/fixtures/copytestdb.mdb").unwrap();
+    let file = File::create(scratch.join("copytestdb.mdb")).unwrap();
 
     unsafe {
         let fd = get_file_fd(&file);
@@ -95,4 +109,6 @@ fn test_simple(env_path: &str) {
         mdb_dbi_close(env, dbi);
         mdb_env_close(env);
     }
+
+    let _ = fs::remove_dir_all(&scratch);
 }

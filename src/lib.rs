@@ -36,7 +36,7 @@ macro_rules! lmdb_try_with_cleanup {
 }
 
 #[cfg(not(target_pointer_width = "64"))]
-compile_error!("Mintlayer with lmdb backend can only be compiled on 64-bit systems. Either seek an alternative storage backend or use a 64-bit system.");
+compile_error!("LMDB backend can only be compiled on 64-bit systems. Either seek an alternative storage backend or use a 64-bit system.");
 
 mod cursor;
 mod database;

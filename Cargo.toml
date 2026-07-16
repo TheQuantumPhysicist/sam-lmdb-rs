@@ -1,11 +1,11 @@
 [package]
-name = "lmdb-mintlayer"
+name = "sam-lmdb-rs"
 version = "0.16.2"
 license = "Apache-2.0"
 edition = "2021"
 description = "Idiomatic and safe LMDB wrapper."
-homepage = "https://github.com/mozilla/lmdb-rs-mintlayer"
-repository = "https://github.com/mozilla/lmdb-rs-mintlayer.git"
+homepage = "https://github.com/TheQuantumPhysicist/sam-lmdb-rs"
+repository = "https://github.com/TheQuantumPhysicist/sam-lmdb-rs"
 readme = "README.md"
 keywords = ["LMDB", "database", "storage-engine", "bindings", "library"]
 categories = ["database"]
@@ -33,15 +33,13 @@ libc = "0.2"
 fs4 = { version = "0.6", features = ["sync"] }
 num = "0.4"
 
-# In order to ensure that we test lmdb-rkv in CI against the in-tree version
-# of lmdb-rkv-sys, we specify the dependency as a path here.
+# The sys crate is a path dependency so that we always build against the
+# in-tree, patched LMDB (imported from Monero, plus local fixes), which has
+# diverged from the upstream lmdb-rkv-sys crate on crates.io.
 #
-# But we can't publish the lmdb-rkv crate to crates.io with a path dependency,
-# so we have to temporarily change this to point to the current version
-# of lmdb-rkv-sys on crates.io when publishing lmdb-rkv to that crate registry.
-#
-# (See "Publishing to crates.io" in README.md for more information.)
-lmdb-rkv-sys = { path = "./lmdb-sys" }
+# To publish this crate to crates.io, publish sam-lmdb-sys first; published
+# builds resolve the dependency through the `version` below.
+sam-lmdb-sys = { path = "./lmdb-sys", version = "0.11.3" }
 
 [dev-dependencies]
 rand = "0.8"
@@ -51,10 +49,10 @@ criterion = "0.4"
 
 [features]
 default = []
-with-asan = ["lmdb-rkv-sys/with-asan"]
-with-tsan = ["lmdb-rkv-sys/with-tsan"]
-with-fuzzer = ["lmdb-rkv-sys/with-fuzzer"]
-with-fuzzer-no-link = ["lmdb-rkv-sys/with-fuzzer-no-link"]
+with-asan = ["sam-lmdb-sys/with-asan"]
+with-tsan = ["sam-lmdb-sys/with-tsan"]
+with-fuzzer = ["sam-lmdb-sys/with-fuzzer"]
+with-fuzzer-no-link = ["sam-lmdb-sys/with-fuzzer-no-link"]
 
 
 [[bench]]

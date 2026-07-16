@@ -33,6 +33,13 @@ const MDB_IDL_LOGN: u8 = 15;
 )))]
 const MDB_IDL_LOGN: u8 = 16;
 
+// Whether linking a system-installed LMDB (found via pkg-config) is allowed
+// instead of building the vendored copy in `lmdb/`.
+//
+// Keep this disabled: the vendored copy carries this fork's patches, and a
+// system library would silently drop them (and ignore MDB_IDL_LOGN).
+const ALLOW_SYSTEM_LMDB: bool = false;
+
 macro_rules! warn {
     ($message:expr) => {
         println!("cargo:warning={}", $message);
@@ -55,7 +62,10 @@ fn main() {
         warn!("Building with `-fsanitize=fuzzer`.");
     }
 
-    if pkg_config::find_library("liblmdb").is_err() {
+    // Probe pkg-config only when explicitly allowed: on success, `find_library`
+    // emits the link directives for the system library as a side effect.
+    let use_system_lmdb = ALLOW_SYSTEM_LMDB && pkg_config::find_library("liblmdb").is_ok();
+    if !use_system_lmdb {
         let mut builder = cc::Build::new();
 
         builder

@@ -9,5 +9,27 @@ Cargo.lock
 # VSCode
 .vscode/
 
+# JetBrains
+.idea/
+
+*.md
+!README.md
+!LICENSE.md
+
 # lmdb tests output
 lmdb-sys/tests/fixtures/copytestdb.mdb
+
+# Build/test artifacts from running `make` in the vendored liblmdb
+# (lmdb-sys/tests/lmdb.rs does this)
+lmdb-sys/lmdb/libraries/liblmdb/*.o
+lmdb-sys/lmdb/libraries/liblmdb/*.a
+lmdb-sys/lmdb/libraries/liblmdb/*.so
+lmdb-sys/lmdb/libraries/liblmdb/*.dylib
+lmdb-sys/lmdb/libraries/liblmdb/mdb_stat
+lmdb-sys/lmdb/libraries/liblmdb/mdb_copy
+lmdb-sys/lmdb/libraries/liblmdb/mdb_dump
+lmdb-sys/lmdb/libraries/liblmdb/mdb_load
+lmdb-sys/lmdb/libraries/liblmdb/mdb_drop
+lmdb-sys/lmdb/libraries/liblmdb/mtest
+lmdb-sys/lmdb/libraries/liblmdb/mtest[0-9]
+lmdb-sys/lmdb/libraries/liblmdb/testdb/

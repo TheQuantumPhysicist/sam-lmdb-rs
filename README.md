@@ -1,17 +1,17 @@
-# lmdb-rs
+# sam-lmdb-rs
 
 Idiomatic and safe APIs for interacting with the
-[Symas Lightning Memory-Mapped Database (LMDB)](http://symas.com/mdb/).
+[Symas Lightning Memory-Mapped Database (LMDB)](https://symas.com/lmdb/).
 
-This repo is a fork of [mozilla/rkv](https://github.com/mozilla/rkv)
-with fixes for issues encountered by [mintlayer/mintlayer-core](https://github.com/mintlayer/mintlayer-core).
+This repo is a fork of [mozilla/lmdb-rs](https://github.com/mozilla/lmdb-rs)
+with fixes for issues encountered when using it.
 
 ## Building from Source
 
 ```bash
-git clone --recursive https://github.com/mintlayer/lmdb-rs-mintlayer
-cd lmdb-rs
-cargo build
+git clone https://github.com/TheQuantumPhysicist/sam-lmdb-rs
+cd sam-lmdb-rs
+cargo build --release
 ```
 
 ## lmdb source
