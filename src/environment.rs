@@ -44,7 +44,10 @@ pub struct Environment {
     tx_blocker_count: AtomicU32,
     db_resize_lock: Mutex<()>,
     dbi_open_mutex: Mutex<()>,
-    resize_callback: Option<Box<dyn Fn(DatabaseResizeInfo)>>,
+    // - Send + Sync is required because Environment asserts both, and the callback is carried
+    //   along with it; without the bound a closure could capture a value that is unsafe to
+    //   share across threads, and the unsafe impls below would be handing out a false promise
+    resize_callback: Option<Box<dyn Fn(DatabaseResizeInfo) + Send + Sync>>,
     resize_settings: Option<DatabaseResizeSettings>,
     db_path: PathBuf,
 }
@@ -363,7 +366,7 @@ impl Environment {
 
     /// Check whether a resize is needed under two conditions:
     /// 1. The headroom + currently used size don't fit in map_size()
-    /// 2. More than RESIZE_PERCENTage is used of the database
+    /// 2. The used fraction of the database crosses the configured resize trigger fraction
     fn needs_resize(&self, headroom: Option<usize>) -> Result<bool> {
         let stat = self.stat()?;
         let env_info = self.info()?;
@@ -372,7 +375,7 @@ impl Environment {
 
         let current_map_size = env_info.map_size();
 
-        let current_percentage_used = size_used as f32 / current_map_size as f32;
+        let current_fraction_used = size_used as f32 / current_map_size as f32;
 
         if let Some(given_headroom) = headroom {
             if env_info.map_size() < given_headroom.checked_add(size_used).expect("LMDB size check addition failed") {
@@ -382,7 +385,7 @@ impl Environment {
 
         let resize_settings = self.resize_settings.as_ref().unwrap_or(&DEFAULT_RESIZE_SETTINGS);
 
-        Ok(current_percentage_used > resize_settings.resize_trigger_percentage)
+        Ok(current_fraction_used > resize_settings.resize_trigger_fraction.as_f32())
     }
 
     /// Do the resizing. This blocks until every transaction live in this process has finished, then
@@ -578,6 +581,32 @@ impl Info {
     }
 }
 
+// - the two unsafe impls below are unconditional, so the compiler stops re-deriving Send and Sync
+//   from the fields and never complains again no matter what the fields become
+// - what makes them sound is an audit: every field except the raw env pointer is safe to move and
+//   share across threads on its own, and the pointer itself is safe because LMDB does its own
+//   locking behind it
+// - the boxed resize callback is the weakest link, because its thread-safety comes from a bound
+//   written by hand on the field type; dropping that bound would let a caller hand over a closure
+//   that is not safe to share, and nothing would catch it
+// - passing each audited field through a gate that demands Send + Sync turns a dropped bound, or a
+//   field swapped for a type that is not shareable, into a build error
+// - a newly added field still has to be added here by hand; the gate pins the audit as written, it
+//   does not discover fields on its own
+// - the raw MDB_env pointer is deliberately absent: it is the one field that cannot pass the gate,
+//   and it is the whole reason these unsafe impls are written by hand
+fn _assert_environment_audited_fields_are_send_sync(env: &Environment) {
+    fn gate<T: Send + Sync + ?Sized>(_: &T) {}
+
+    gate(&env.tx_count);
+    gate(&env.tx_blocker_count);
+    gate(&env.db_resize_lock);
+    gate(&env.dbi_open_mutex);
+    gate(&env.resize_callback);
+    gate(&env.resize_settings);
+    gate(&env.db_path);
+}
+
 unsafe impl Send for Environment {}
 unsafe impl Sync for Environment {}
 
@@ -610,7 +639,7 @@ pub struct EnvironmentBuilder {
     max_readers: Option<c_uint>,
     max_dbs: Option<c_uint>,
     map_size: Option<size_t>,
-    resize_callback: Option<Box<dyn Fn(DatabaseResizeInfo)>>,
+    resize_callback: Option<Box<dyn Fn(DatabaseResizeInfo) + Send + Sync>>,
     resize_settings: Option<DatabaseResizeSettings>,
 }
 
@@ -721,7 +750,38 @@ impl EnvironmentBuilder {
     ///
     /// Opening a read transaction with `begin_ro_txn` is allowed: the map has already been replaced
     /// by the time the callback runs, and the block on new transactions is lifted before the call.
-    pub fn set_resize_callback(mut self, callback: Option<Box<dyn Fn(DatabaseResizeInfo)>>) -> EnvironmentBuilder {
+    ///
+    /// The callback is stored in the [`Environment`], which can be shared across threads, so the
+    /// callback has to be safe to send and share too. A closure that captures something which is
+    /// not, such as an [`Rc`](std::rc::Rc), is refused at compile time:
+    ///
+    /// ```compile_fail,E0277
+    /// use lmdb::{DatabaseResizeInfo, Environment};
+    /// use std::rc::Rc;
+    ///
+    /// let not_send = Rc::new(());
+    /// Environment::new().set_resize_callback(Some(Box::new(move |_info: DatabaseResizeInfo| {
+    ///     drop(not_send.clone());
+    /// })));
+    /// ```
+    ///
+    /// A callback that captures only shareable state is accepted:
+    ///
+    /// ```
+    /// use lmdb::{DatabaseResizeInfo, Environment};
+    /// use std::sync::atomic::{AtomicU64, Ordering};
+    /// use std::sync::Arc;
+    ///
+    /// let resize_count = Arc::new(AtomicU64::new(0));
+    /// let counter = Arc::clone(&resize_count);
+    /// Environment::new().set_resize_callback(Some(Box::new(move |_info: DatabaseResizeInfo| {
+    ///     counter.fetch_add(1, Ordering::Relaxed);
+    /// })));
+    /// ```
+    pub fn set_resize_callback(
+        mut self,
+        callback: Option<Box<dyn Fn(DatabaseResizeInfo) + Send + Sync>>,
+    ) -> EnvironmentBuilder {
         self.resize_callback = callback;
         self
     }
@@ -749,6 +809,7 @@ mod test {
     use tempdir::TempDir;
 
     use crate::flags::*;
+    use crate::resize::ResizeTriggerFraction;
 
     use super::*;
 
@@ -1099,7 +1160,7 @@ mod test {
             min_resize_step: 1 << 20,
             max_resize_step: 1 << 21,
             default_resize_ratio_percentage: 10,
-            resize_trigger_percentage: 0.9,
+            resize_trigger_fraction: ResizeTriggerFraction::new(0.9).unwrap(),
         };
 
         let dir = TempDir::new("test").unwrap();
@@ -1155,7 +1216,7 @@ mod test {
             min_resize_step: 1 << 19,
             max_resize_step: 1 << 21,
             default_resize_ratio_percentage: 20,
-            resize_trigger_percentage: 0.9,
+            resize_trigger_fraction: ResizeTriggerFraction::new(0.9).unwrap(),
         };
 
         let dir = TempDir::new("test").unwrap();
@@ -1193,11 +1254,11 @@ mod test {
             // make sure that we always crossed the provided threshold before resizing
             assert!(
                 act.occupied_size_before_resize as f32 / act.old_size as f32
-                    >= resize_settings.resize_trigger_percentage,
+                    >= resize_settings.resize_trigger_fraction.as_f32(),
                 "resize ratio check failed: {} / {} >= {}",
                 act.occupied_size_before_resize as f32,
                 act.old_size as f32,
-                resize_settings.resize_trigger_percentage
+                resize_settings.resize_trigger_fraction.as_f32()
             )
         }
 
@@ -1220,7 +1281,7 @@ mod test {
             min_resize_step: 1 << 15,
             max_resize_step: 1 << 21,
             default_resize_ratio_percentage: 1,
-            resize_trigger_percentage: 0.9,
+            resize_trigger_fraction: ResizeTriggerFraction::new(0.9).unwrap(),
         };
 
         let dir = TempDir::new("test").unwrap();
@@ -1302,7 +1363,7 @@ mod test {
             min_resize_step: 1 << 20,
             max_resize_step: 1 << 21,
             default_resize_ratio_percentage: 50,
-            resize_trigger_percentage: 0.9,
+            resize_trigger_fraction: ResizeTriggerFraction::new(0.9).unwrap(),
         };
 
         let dir = TempDir::new("test").unwrap();
@@ -1348,7 +1409,7 @@ mod test {
             min_resize_step: 1 << 17,
             max_resize_step: 1 << 19,
             default_resize_ratio_percentage: 10,
-            resize_trigger_percentage: 0.9,
+            resize_trigger_fraction: ResizeTriggerFraction::new(0.9).unwrap(),
         };
 
         let dir = TempDir::new("test").unwrap();
@@ -1373,7 +1434,7 @@ mod test {
             min_resize_step: 1 << 16,
             max_resize_step: 1 << 18,
             default_resize_ratio_percentage: 10,
-            resize_trigger_percentage: 0.9,
+            resize_trigger_fraction: ResizeTriggerFraction::new(0.9).unwrap(),
         }
     }
 
@@ -1385,7 +1446,7 @@ mod test {
             min_resize_step: 1 << 45,
             max_resize_step: 1 << 55,
             default_resize_ratio_percentage: 10,
-            resize_trigger_percentage: 0.9,
+            resize_trigger_fraction: ResizeTriggerFraction::new(0.9).unwrap(),
         };
         let dir = TempDir::new("test").unwrap();
         let env =
