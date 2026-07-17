@@ -427,14 +427,14 @@ impl<'env> RwTransaction<'env> {
         let mut nested: *mut ffi::MDB_txn = ptr::null_mut();
         unsafe {
             let env: *mut ffi::MDB_env = ffi::mdb_txn_env(self.txn());
-            ffi::mdb_txn_begin(env, self.txn(), 0, &mut nested);
+            lmdb_result(ffi::mdb_txn_begin(env, self.txn(), 0, &mut nested))?;
+            Ok(RwTransaction {
+                txn: nested,
+                env: self.env,
+                _guard: TransactionGuard::new(self.env),
+                _marker: PhantomData,
+            })
         }
-        Ok(RwTransaction {
-            txn: nested,
-            env: self.env,
-            _guard: TransactionGuard::new(self.env),
-            _marker: PhantomData,
-        })
     }
 }
 
@@ -593,6 +593,20 @@ mod test {
 
         assert_eq!(txn.get(db, b"key1").unwrap(), b"val1");
         assert_eq!(txn.get(db, b"key2"), Err(Error::NotFound));
+    }
+
+    #[test]
+    fn test_nested_txn_propagates_begin_error() {
+        // LMDB forbids nested transactions when the environment uses WRITE_MAP:
+        // mdb_txn_begin returns MDB_BAD_TXN. begin_nested_txn must surface that
+        // as Err. The prior code discarded the return code and handed back an
+        // RwTransaction wrapping a null txn pointer.
+        let dir = TempDir::new("test").unwrap();
+        let env = Environment::new().set_flags(EnvironmentFlags::WRITE_MAP).open(dir.path()).unwrap();
+
+        let mut txn = env.begin_rw_txn(None).unwrap();
+        let result = txn.begin_nested_txn();
+        assert!(result.is_err());
     }
 
     #[test]

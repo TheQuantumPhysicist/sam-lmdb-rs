@@ -39,7 +39,6 @@ bitflags! {
         #[doc="or `Environment::sync`. This optimization maintains database integrity, but a"]
         #[doc="system crash may undo the last committed transaction. I.e. it preserves the ACI"]
         #[doc="(atomicity, consistency, isolation) but not D (durability) database property."]
-        #[doc="\n\nThis flag may be changed at any time using `Environment::set_flags`."]
         const NO_META_SYNC = MDB_NOMETASYNC;
 
         #[doc="Don't flush system buffers to disk when committing a transaction. This optimization"]
@@ -52,23 +51,20 @@ bitflags! {
         #[doc="crash may undo the final transactions. Note that (`NO_SYNC | WRITE_MAP`) leaves the"]
         #[doc="system with no hint for when to write transactions to disk, unless"]
         #[doc="`Environment::sync` is called. (`MAP_ASYNC | WRITE_MAP`) may be preferable."]
-        #[doc="\n\nThis flag may be changed at any time using `Environment::set_flags`."]
         const NO_SYNC = MDB_NOSYNC;
 
         #[doc="When using `WRITE_MAP`, use asynchronous flushes to disk. As with `NO_SYNC`, a"]
         #[doc="system crash can then corrupt the database or lose the last transactions. Calling"]
         #[doc="`Environment::sync` ensures on-disk database integrity until next commit."]
-        #[doc="\n\nThis flag may be changed at any time using `Environment::set_flags`."]
         const MAP_ASYNC = MDB_MAPASYNC;
 
         #[doc="Don't use thread-local storage. Tie reader locktable slots to transaction objects"]
         #[doc="instead of to threads. I.e. `RoTransaction::reset` keeps the slot reserved for the"]
         #[doc="transaction object. A thread may use parallel read-only transactions. A read-only"]
         #[doc="transaction may span threads if the user synchronizes its use. Applications that"]
-        #[doc="multiplex many the user synchronizes its use. Applications that multiplex many user"]
-        #[doc="threads over individual OS threads need this option. Such an application must also"]
-        #[doc="serialize the write transactions in an OS thread, since LMDB's write locking is"]
-        #[doc="unaware of the user threads."]
+        #[doc="multiplex many user threads over individual OS threads need this option. Such an"]
+        #[doc="application must also serialize the write transactions in an OS thread, since LMDB's"]
+        #[doc="write locking is unaware of the user threads."]
         const NO_TLS = MDB_NOTLS;
 
         #[doc="Do not do any locking. If concurrent access is anticipated, the caller must manage"]
@@ -98,7 +94,6 @@ bitflags! {
         #[doc="instead of using malloc for pages. The initialization is also skipped if writing"]
         #[doc="with reserve; the caller is expected to overwrite all of the memory that was"]
         #[doc="reserved in that case."]
-        #[doc="\n\nThis flag may be changed at any time using `Environment::set_flags`."]
         const NO_MEM_INIT = MDB_NOMEMINIT;
     }
 }
