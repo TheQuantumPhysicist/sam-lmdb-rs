@@ -1,4 +1,4 @@
-use criterion::{Bencher, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Bencher, Criterion, criterion_group, criterion_main};
 
 use lmdb_sys as ffi;
 
@@ -8,6 +8,7 @@ use ffi::*;
 use libc::size_t;
 use lmdb::{Transaction, WriteFlags};
 use rand::seq::SliceRandom;
+use std::hint::black_box;
 use std::ptr;
 use utils::*;
 
@@ -60,7 +61,7 @@ fn bench_get_rand_raw(b: &mut Bencher) {
 
             i += key_val.mv_size;
         }
-        core::hint::black_box(i);
+        black_box(i);
     });
 }
 

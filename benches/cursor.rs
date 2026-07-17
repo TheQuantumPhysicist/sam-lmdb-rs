@@ -2,10 +2,11 @@ use lmdb_sys as ffi;
 
 mod utils;
 
-use criterion::{Bencher, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Bencher, Criterion, criterion_group, criterion_main};
 
 use ffi::*;
 use lmdb::{Cursor, Result, RoCursor, Transaction};
+use std::hint::black_box;
 use std::ptr;
 use utils::*;
 

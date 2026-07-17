@@ -1,7 +1,5 @@
 target/
 
-Cargo.lock
-
 # The cache for docker container dependency
 .cargo
 .cargo-ok
