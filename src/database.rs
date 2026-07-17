@@ -4,7 +4,7 @@ use std::ptr;
 
 use lmdb_sys as ffi;
 
-use crate::error::{lmdb_result, Error, Result};
+use crate::error::{Error, Result, lmdb_result};
 
 /// A handle to an individual database in an environment.
 ///
@@ -36,7 +36,8 @@ impl Database {
             ptr::null()
         };
         let mut dbi: ffi::MDB_dbi = 0;
-        lmdb_result(ffi::mdb_dbi_open(txn, name_ptr, flags, &mut dbi))?;
+        // - Only the FFI call is unsafe; the name conversion and struct build are safe.
+        unsafe { lmdb_result(ffi::mdb_dbi_open(txn, name_ptr, flags, &mut dbi)) }?;
         Ok(Database {
             dbi,
         })

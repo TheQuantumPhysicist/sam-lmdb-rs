@@ -1,10 +1,10 @@
 use std::marker::PhantomData;
 use std::{fmt, mem, ptr, result, slice};
 
-use libc::{c_uint, c_void, size_t, EINVAL};
+use libc::{EINVAL, c_uint, c_void, size_t};
 
 use crate::database::Database;
-use crate::error::{lmdb_result, Error, Result};
+use crate::error::{Error, Result, lmdb_result};
 use crate::flags::WriteFlags;
 use crate::transaction::Transaction;
 use lmdb_sys as ffi;
@@ -418,7 +418,7 @@ unsafe fn slice_to_val(slice: Option<&[u8]>) -> ffi::MDB_val {
 }
 
 unsafe fn val_to_slice<'a>(val: ffi::MDB_val) -> &'a [u8] {
-    slice::from_raw_parts(val.mv_data as *const u8, val.mv_size)
+    unsafe { slice::from_raw_parts(val.mv_data as *const u8, val.mv_size) }
 }
 
 /// An iterator over the key/value pairs in an LMDB database.
@@ -592,7 +592,7 @@ mod test {
     use crate::flags::*;
     use ffi::*;
     use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
     use std::collections::{BTreeMap, BTreeSet};
     use tempdir::TempDir;
 
@@ -1176,7 +1176,7 @@ mod test {
         let seed: u64 = rand::random();
         println!("test_iter_rev_randomized seed: {}", seed);
         // Replaying a hardcoded seed is valid only while rand stays pinned to
-        // 0.8; StdRng's algorithm is not stable across rand major versions.
+        // 0.10; StdRng's algorithm is not stable across rand major versions.
         let mut rng = StdRng::seed_from_u64(seed);
 
         let dir = TempDir::new("test").unwrap();
@@ -1189,8 +1189,8 @@ mod test {
 
         let mut txn = env.begin_rw_txn(None).unwrap();
         for _ in 0..500 {
-            let key: Vec<u8> = (0..rng.gen_range(1..=32)).map(|_| rng.gen()).collect();
-            let value: Vec<u8> = (0..rng.gen_range(0..=16)).map(|_| rng.gen()).collect();
+            let key: Vec<u8> = (0..rng.random_range(1..=32)).map(|_| rng.random()).collect();
+            let value: Vec<u8> = (0..rng.random_range(0..=16)).map(|_| rng.random()).collect();
             txn.put(db, &key, &value, WriteFlags::empty()).unwrap();
             oracle.insert(key, value);
         }
@@ -1205,11 +1205,11 @@ mod test {
 
         // Random probes: half drawn from present keys, half fresh and mostly absent.
         for _ in 0..64 {
-            let probe: Vec<u8> = if rng.gen_bool(0.5) {
-                let index = rng.gen_range(0..oracle.len());
+            let probe: Vec<u8> = if rng.random_bool(0.5) {
+                let index = rng.random_range(0..oracle.len());
                 oracle.keys().nth(index).unwrap().clone()
             } else {
-                (0..rng.gen_range(1..=32)).map(|_| rng.gen()).collect()
+                (0..rng.random_range(1..=32)).map(|_| rng.random()).collect()
             };
             let expected: Vec<(&[u8], &[u8])> =
                 oracle.range(..=probe.clone()).rev().map(|(key, value)| (key.as_slice(), value.as_slice())).collect();
@@ -1225,7 +1225,7 @@ mod test {
         let seed: u64 = rand::random();
         println!("test_iter_rev_dup_randomized seed: {}", seed);
         // Replaying a hardcoded seed is valid only while rand stays pinned to
-        // 0.8; StdRng's algorithm is not stable across rand major versions.
+        // 0.10; StdRng's algorithm is not stable across rand major versions.
         let mut rng = StdRng::seed_from_u64(seed);
 
         let dir = TempDir::new("test").unwrap();
@@ -1240,11 +1240,11 @@ mod test {
 
         let mut txn = env.begin_rw_txn(None).unwrap();
         for _ in 0..300 {
-            let key: Vec<u8> = (0..rng.gen_range(1..=32)).map(|_| rng.gen()).collect();
+            let key: Vec<u8> = (0..rng.random_range(1..=32)).map(|_| rng.random()).collect();
             // DUP_SORT stores each duplicate value as a key in a sub-database,
             // and LMDB rejects empty keys, so a duplicate value must be at least
             // one byte. Zero-length values cannot round-trip here.
-            let value: Vec<u8> = (0..rng.gen_range(1..=16)).map(|_| rng.gen()).collect();
+            let value: Vec<u8> = (0..rng.random_range(1..=16)).map(|_| rng.random()).collect();
             txn.put(db, &key, &value, WriteFlags::empty()).unwrap();
             oracle.entry(key).or_default().insert(value);
         }
@@ -1264,11 +1264,11 @@ mod test {
 
         // Random probes: half drawn from present keys, half fresh and mostly absent.
         for _ in 0..32 {
-            let probe: Vec<u8> = if rng.gen_bool(0.5) {
-                let index = rng.gen_range(0..oracle.len());
+            let probe: Vec<u8> = if rng.random_bool(0.5) {
+                let index = rng.random_range(0..oracle.len());
                 oracle.keys().nth(index).unwrap().clone()
             } else {
-                (0..rng.gen_range(1..=32)).map(|_| rng.gen()).collect()
+                (0..rng.random_range(1..=32)).map(|_| rng.random()).collect()
             };
             let expected: Vec<(&[u8], &[u8])> = oracle
                 .range(..=probe.clone())
@@ -1532,7 +1532,7 @@ mod test {
         let seed: u64 = rand::random();
         println!("test_rw_cursor_walk_and_delete_randomized seed: {}", seed);
         // Replaying a hardcoded seed is valid only while rand stays pinned to
-        // 0.8; StdRng's algorithm is not stable across rand major versions.
+        // 0.10; StdRng's algorithm is not stable across rand major versions.
         let mut rng = StdRng::seed_from_u64(seed);
 
         let dir = TempDir::new("test").unwrap();
@@ -1544,10 +1544,10 @@ mod test {
         let mut oracle: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
 
         let mut txn = env.begin_rw_txn(None).unwrap();
-        let count: usize = rng.gen_range(1..=400);
+        let count: usize = rng.random_range(1..=400);
         for _ in 0..count {
-            let key: Vec<u8> = (0..rng.gen_range(1..=32)).map(|_| rng.gen()).collect();
-            let value: Vec<u8> = (0..rng.gen_range(0..=16)).map(|_| rng.gen()).collect();
+            let key: Vec<u8> = (0..rng.random_range(1..=32)).map(|_| rng.random()).collect();
+            let value: Vec<u8> = (0..rng.random_range(0..=16)).map(|_| rng.random()).collect();
             txn.put(db, &key, &value, WriteFlags::empty()).unwrap();
             oracle.insert(key, value);
         }
@@ -1555,7 +1555,7 @@ mod test {
         // A random threshold on the key's first byte drives the deletions, so a
         // run covers lone deletes, runs of consecutive deletes, and deletes at
         // either end.
-        let threshold: u8 = rng.gen();
+        let threshold: u8 = rng.random();
         let doomed = |key: &[u8]| match key.first() {
             Some(byte) => *byte < threshold,
             None => false,
@@ -1591,7 +1591,7 @@ mod test {
         let seed: u64 = rand::random();
         println!("test_rw_cursor_walk_and_delete_dup_randomized seed: {}", seed);
         // Replaying a hardcoded seed is valid only while rand stays pinned to
-        // 0.8; StdRng's algorithm is not stable across rand major versions.
+        // 0.10; StdRng's algorithm is not stable across rand major versions.
         let mut rng = StdRng::seed_from_u64(seed);
 
         let dir = TempDir::new("test").unwrap();
@@ -1605,22 +1605,22 @@ mod test {
         let mut oracle: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>> = BTreeMap::new();
 
         let mut txn = env.begin_rw_txn(None).unwrap();
-        let count: usize = rng.gen_range(1..=300);
+        let count: usize = rng.random_range(1..=300);
         for _ in 0..count {
             // A small key alphabet piles duplicates under each key instead of
             // making every key unique.
-            let key: Vec<u8> = vec![rng.gen_range(b'a'..=b'e')];
+            let key: Vec<u8> = vec![rng.random_range(b'a'..=b'e')];
             // DUP_SORT stores each duplicate value as a key in a sub-database,
             // and LMDB rejects empty keys, so a duplicate value must be at least
             // one byte.
-            let value: Vec<u8> = (0..rng.gen_range(1..=16)).map(|_| rng.gen()).collect();
+            let value: Vec<u8> = (0..rng.random_range(1..=16)).map(|_| rng.random()).collect();
             txn.put(db, &key, &value, WriteFlags::empty()).unwrap();
             oracle.entry(key).or_default().insert(value);
         }
 
         // The predicate reads the duplicate value, so deletions land inside a
         // key's duplicate run as well as at its edges.
-        let threshold: u8 = rng.gen();
+        let threshold: u8 = rng.random();
         let doomed = |value: &[u8]| match value.first() {
             Some(byte) => *byte < threshold,
             None => false,

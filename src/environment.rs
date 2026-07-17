@@ -6,8 +6,8 @@ use std::ffi::OsStr;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU32;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU32;
 use std::{fmt, mem, ptr, result};
 
 use lmdb_sys as ffi;
@@ -16,11 +16,11 @@ use byteorder::{ByteOrder, NativeEndian};
 
 use crate::cursor::Cursor;
 use crate::database::Database;
-use crate::error::{lmdb_result, Error, Result};
+use crate::error::{Error, Result, lmdb_result};
 use crate::flags::{DatabaseFlags, EnvironmentFlags};
 use crate::transaction::{RoTransaction, RwTransaction, Transaction};
 
-use crate::resize::{DatabaseResizeInfo, DatabaseResizeSettings, DEFAULT_RESIZE_SETTINGS};
+use crate::resize::{DEFAULT_RESIZE_SETTINGS, DatabaseResizeInfo, DatabaseResizeSettings};
 use crate::transaction_guard::{ScopedTransactionBlocker, TransactionGuard};
 
 #[cfg(windows)]
@@ -238,7 +238,9 @@ impl Environment {
     /// Doing so can cause misbehavior from database corruption to errors like
     /// `Error::BadValSize` (since the DB name is gone).
     pub unsafe fn close_db(&mut self, db: Database) {
-        ffi::mdb_dbi_close(self.env, db.dbi());
+        unsafe {
+            ffi::mdb_dbi_close(self.env, db.dbi());
+        }
     }
 
     /// Retrieves statistics about this environment.
@@ -377,10 +379,10 @@ impl Environment {
 
         let current_fraction_used = size_used as f32 / current_map_size as f32;
 
-        if let Some(given_headroom) = headroom {
-            if env_info.map_size() < given_headroom.checked_add(size_used).expect("LMDB size check addition failed") {
-                return Ok(true);
-            }
+        if let Some(given_headroom) = headroom
+            && env_info.map_size() < given_headroom.checked_add(size_used).expect("LMDB size check addition failed")
+        {
+            return Ok(true);
         }
 
         let resize_settings = self.resize_settings.as_ref().unwrap_or(&DEFAULT_RESIZE_SETTINGS);
@@ -805,7 +807,7 @@ mod test {
 
     use byteorder::{ByteOrder, LittleEndian};
     use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
     use tempdir::TempDir;
 
     use crate::flags::*;
@@ -1061,17 +1063,17 @@ mod test {
         let seed: u64 = rand::random();
         println!("test_set_map_size_waits_for_live_readers_randomized seed: {seed}");
         // Replaying a hardcoded seed is valid only while rand stays pinned to
-        // 0.8; StdRng's algorithm is not stable across rand major versions.
+        // 0.10; StdRng's algorithm is not stable across rand major versions.
         // A replay reproduces the RNG-derived inputs only, not the thread interleaving, which no
         // seed controls; that is inherent to a concurrency test.
         let mut rng = StdRng::seed_from_u64(seed);
 
         for round in 0..4u32 {
-            let n_readers = rng.gen_range(1..=6usize);
-            let hold = Duration::from_millis(rng.gen_range(50..=150));
-            let new_map_size = rng.gen_range(2..=8usize) * (1usize << 20);
-            let value_len = rng.gen_range(1..=4096usize);
-            let value: Vec<u8> = (0..value_len).map(|_| rng.gen::<u8>()).collect();
+            let n_readers = rng.random_range(1..=6usize);
+            let hold = Duration::from_millis(rng.random_range(50..=150));
+            let new_map_size = rng.random_range(2..=8usize) * (1usize << 20);
+            let value_len = rng.random_range(1..=4096usize);
+            let value: Vec<u8> = (0..value_len).map(|_| rng.random::<u8>()).collect();
 
             let dir = TempDir::new("test").unwrap();
             let env = Arc::new(Environment::new().set_map_size(1 << 20).open(dir.path()).unwrap());
@@ -1135,9 +1137,9 @@ mod test {
         let mut total_size = 0;
 
         while total_size < required_size {
-            let key_size = 1 + rand::random::<usize>() % key_max_size;
+            let key_size = rand::rng().random_range(1..=key_max_size);
             let key = (0..key_size).map(|_| rand::random::<u8>()).collect::<Vec<_>>();
-            let val_size = 1 + rand::random::<usize>() % val_max_size;
+            let val_size = rand::rng().random_range(1..=val_max_size);
             let val = (0..val_size).map(|_| rand::random::<u8>()).collect::<Vec<_>>();
             result.insert(key, val);
 

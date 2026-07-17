@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, Bencher, Criterion};
+use criterion::{Bencher, Criterion, black_box, criterion_group, criterion_main};
 
 use lmdb_sys as ffi;
 
@@ -7,7 +7,7 @@ mod utils;
 use ffi::*;
 use libc::size_t;
 use lmdb::{Transaction, WriteFlags};
-use rand::{seq::SliceRandom, SeedableRng};
+use rand::seq::SliceRandom;
 use std::ptr;
 use utils::*;
 
@@ -18,7 +18,7 @@ fn bench_get_rand(b: &mut Bencher) {
     let txn = env.begin_ro_txn().unwrap();
 
     let mut keys: Vec<String> = (0..n).map(get_key).collect();
-    keys.shuffle(&mut rand::rngs::StdRng::from_entropy());
+    keys.shuffle(&mut rand::rng());
 
     b.iter(|| {
         let mut i = 0usize;
@@ -36,7 +36,7 @@ fn bench_get_rand_raw(b: &mut Bencher) {
     let _txn = env.begin_ro_txn().unwrap();
 
     let mut keys: Vec<String> = (0..n).map(get_key).collect();
-    keys.shuffle(&mut rand::rngs::StdRng::from_entropy());
+    keys.shuffle(&mut rand::rng());
 
     let dbi = db.dbi();
     let txn = _txn.txn();
@@ -70,7 +70,7 @@ fn bench_put_rand(b: &mut Bencher) {
     let db = env.open_db(None).unwrap();
 
     let mut items: Vec<(String, String)> = (0..n).map(|n| (get_key(n), get_data(n))).collect();
-    items.shuffle(&mut rand::rngs::StdRng::from_entropy());
+    items.shuffle(&mut rand::rng());
 
     b.iter(|| {
         let mut txn = env.begin_rw_txn(None).unwrap();
@@ -87,7 +87,7 @@ fn bench_put_rand_raw(b: &mut Bencher) {
     let db = _env.open_db(None).unwrap();
 
     let mut items: Vec<(String, String)> = (0..n).map(|n| (get_key(n), get_data(n))).collect();
-    items.shuffle(&mut rand::rngs::StdRng::from_entropy());
+    items.shuffle(&mut rand::rng());
 
     let dbi = db.dbi();
     let env = _env.env();

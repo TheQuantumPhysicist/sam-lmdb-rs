@@ -1,6 +1,6 @@
 use super::*;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 // The bug this type exists to stop: 90.0 reads as "90 percent" but the setting is a fraction,
 // so it would pass a lower-bound-only check and then never trigger a resize.
@@ -112,11 +112,11 @@ fn random_in_range_fractions_are_accepted() {
     let seed: u64 = rand::random();
     println!("random_in_range_fractions_are_accepted seed: {}", seed);
     // Replaying a hardcoded seed is valid only while rand stays pinned to
-    // 0.8; StdRng's algorithm is not stable across rand major versions.
+    // 0.10; StdRng's algorithm is not stable across rand major versions.
     let mut rng = StdRng::seed_from_u64(seed);
 
     for _ in 0..1000 {
-        let fraction: f32 = rng.gen_range(0.0..=1.0);
+        let fraction: f32 = rng.random_range(0.0..=1.0);
         let built = ResizeTriggerFraction::new(fraction);
         assert!(built.is_ok(), "seed {}: {} is in range and must be accepted", seed, fraction);
         assert_eq!(built.unwrap().as_f32(), fraction, "seed {}: value must round-trip", seed);
@@ -129,14 +129,14 @@ fn random_out_of_range_fractions_are_rejected() {
     let seed: u64 = rand::random();
     println!("random_out_of_range_fractions_are_rejected seed: {}", seed);
     // Replaying a hardcoded seed is valid only while rand stays pinned to
-    // 0.8; StdRng's algorithm is not stable across rand major versions.
+    // 0.10; StdRng's algorithm is not stable across rand major versions.
     let mut rng = StdRng::seed_from_u64(seed);
 
     for _ in 0..1000 {
-        let above: f32 = rng.gen_range(1.0001..1.0e6);
+        let above: f32 = rng.random_range(1.0001..1.0e6);
         assert!(ResizeTriggerFraction::new(above).is_err(), "seed {}: {} is above 1 and must be rejected", seed, above);
 
-        let below: f32 = rng.gen_range(-1.0e6..-0.0001);
+        let below: f32 = rng.random_range(-1.0e6..-0.0001);
         assert!(ResizeTriggerFraction::new(below).is_err(), "seed {}: {} is below 0 and must be rejected", seed, below);
     }
 }

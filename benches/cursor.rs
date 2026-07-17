@@ -2,7 +2,7 @@ use lmdb_sys as ffi;
 
 mod utils;
 
-use criterion::{black_box, criterion_group, criterion_main, Bencher, Criterion};
+use criterion::{Bencher, Criterion, black_box, criterion_group, criterion_main};
 
 use ffi::*;
 use lmdb::{Cursor, Result, RoCursor, Transaction};

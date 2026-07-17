@@ -1,6 +1,6 @@
 use lmdb_sys::*;
 
-use std::ffi::{c_void, CString};
+use std::ffi::{CString, c_void};
 use std::fs::{self, File};
 use std::path::Path;
 use std::ptr;

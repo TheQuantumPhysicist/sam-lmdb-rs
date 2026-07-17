@@ -199,7 +199,7 @@ pub struct MDB_envinfo {
     #[doc = "< max reader slots used in the environment"]
     pub me_numreaders: libc::c_uint,
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Return the LMDB library version information."]
     #[doc = ""]
     #[doc = " @param[out] major if non-NULL, the library major version number is copied here"]
@@ -212,7 +212,7 @@ extern "C" {
         patch: *mut libc::c_int,
     ) -> *mut libc::c_char;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Return a string describing a given error code."]
     #[doc = ""]
     #[doc = " This function is a superset of the ANSI C X3.159-1989 (ANSI C) strerror(3)"]
@@ -224,7 +224,7 @@ extern "C" {
     #[doc = " @retval \"error message\" The description of the error"]
     pub fn mdb_strerror(err: libc::c_int) -> *mut libc::c_char;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Create an LMDB environment handle."]
     #[doc = ""]
     #[doc = " This function allocates memory for a #MDB_env structure. To release"]
@@ -237,7 +237,7 @@ extern "C" {
     #[doc = " @return A non-zero error value on failure and 0 on success."]
     pub fn mdb_env_create(env: *mut *mut MDB_env) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Open an environment handle."]
     #[doc = ""]
     #[doc = " If this function fails, #mdb_env_close() must be called to discard the #MDB_env handle."]
@@ -365,7 +365,7 @@ extern "C" {
         mode: mdb_mode_t,
     ) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Copy an LMDB environment to the specified path."]
     #[doc = ""]
     #[doc = " This function may be used to make a backup of an existing environment."]
@@ -381,7 +381,7 @@ extern "C" {
     #[doc = " @return A non-zero error value on failure and 0 on success."]
     pub fn mdb_env_copy(env: *mut MDB_env, path: *const libc::c_char) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Copy an LMDB environment to the specified file descriptor."]
     #[doc = ""]
     #[doc = " This function may be used to make a backup of an existing environment."]
@@ -396,7 +396,7 @@ extern "C" {
     #[doc = " @return A non-zero error value on failure and 0 on success."]
     pub fn mdb_env_copyfd(env: *mut MDB_env, fd: mdb_filehandle_t) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Copy an LMDB environment to the specified path, with options."]
     #[doc = ""]
     #[doc = " This function may be used to make a backup of an existing environment."]
@@ -425,7 +425,7 @@ extern "C" {
         flags: libc::c_uint,
     ) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Copy an LMDB environment to the specified file descriptor,"]
     #[doc = "\twith options."]
     #[doc = ""]
@@ -448,7 +448,7 @@ extern "C" {
         flags: libc::c_uint,
     ) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Return statistics about the LMDB environment."]
     #[doc = ""]
     #[doc = " @param[in] env An environment handle returned by #mdb_env_create()"]
@@ -456,7 +456,7 @@ extern "C" {
     #[doc = " \twhere the statistics will be copied"]
     pub fn mdb_env_stat(env: *mut MDB_env, stat: *mut MDB_stat) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Return information about the LMDB environment."]
     #[doc = ""]
     #[doc = " @param[in] env An environment handle returned by #mdb_env_create()"]
@@ -464,7 +464,7 @@ extern "C" {
     #[doc = " \twhere the information will be copied"]
     pub fn mdb_env_info(env: *mut MDB_env, stat: *mut MDB_envinfo) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Flush the data buffers to disk."]
     #[doc = ""]
     #[doc = " Data is always written to disk when #mdb_txn_commit() is called,"]
@@ -485,7 +485,7 @@ extern "C" {
     #[doc = " </ul>"]
     pub fn mdb_env_sync(env: *mut MDB_env, force: libc::c_int) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Close the environment and release the memory map."]
     #[doc = ""]
     #[doc = " Only a single thread may call this function. All transactions, databases,"]
@@ -495,7 +495,7 @@ extern "C" {
     #[doc = " @param[in] env An environment handle returned by #mdb_env_create()"]
     pub fn mdb_env_close(env: *mut MDB_env);
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Set environment flags."]
     #[doc = ""]
     #[doc = " This may be used to set some flags in addition to those from"]
@@ -515,7 +515,7 @@ extern "C" {
         onoff: libc::c_int,
     ) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Get environment flags."]
     #[doc = ""]
     #[doc = " @param[in] env An environment handle returned by #mdb_env_create()"]
@@ -527,7 +527,7 @@ extern "C" {
     #[doc = " </ul>"]
     pub fn mdb_env_get_flags(env: *mut MDB_env, flags: *mut libc::c_uint) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Return the path that was used in #mdb_env_open()."]
     #[doc = ""]
     #[doc = " @param[in] env An environment handle returned by #mdb_env_create()"]
@@ -541,7 +541,7 @@ extern "C" {
     #[doc = " </ul>"]
     pub fn mdb_env_get_path(env: *mut MDB_env, path: *mut *const libc::c_char) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Return the filedescriptor for the given environment."]
     #[doc = ""]
     #[doc = " This function may be called after fork(), so the descriptor can be"]
@@ -557,7 +557,7 @@ extern "C" {
     #[doc = " </ul>"]
     pub fn mdb_env_get_fd(env: *mut MDB_env, fd: *mut mdb_filehandle_t) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Set the size of the memory map to use for this environment."]
     #[doc = ""]
     #[doc = " The size should be a multiple of the OS page size. The default is"]
@@ -591,7 +591,7 @@ extern "C" {
     #[doc = " </ul>"]
     pub fn mdb_env_set_mapsize(env: *mut MDB_env, size: usize) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Set the maximum number of threads/reader slots for the environment."]
     #[doc = ""]
     #[doc = " This defines the number of slots in the lock table that is used to track readers in the"]
@@ -610,7 +610,7 @@ extern "C" {
     #[doc = " </ul>"]
     pub fn mdb_env_set_maxreaders(env: *mut MDB_env, readers: libc::c_uint) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Get the maximum number of threads/reader slots for the environment."]
     #[doc = ""]
     #[doc = " @param[in] env An environment handle returned by #mdb_env_create()"]
@@ -623,7 +623,7 @@ extern "C" {
     pub fn mdb_env_get_maxreaders(env: *mut MDB_env, readers: *mut libc::c_uint)
         -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Set the maximum number of named databases for the environment."]
     #[doc = ""]
     #[doc = " This function is only needed if multiple databases will be used in the"]
@@ -643,7 +643,7 @@ extern "C" {
     #[doc = " </ul>"]
     pub fn mdb_env_set_maxdbs(env: *mut MDB_env, dbs: MDB_dbi) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Get the maximum size of keys and #MDB_DUPSORT data we can write."]
     #[doc = ""]
     #[doc = " Depends on the compile-time constant #MDB_MAXKEYSIZE. Default 511."]
@@ -652,7 +652,7 @@ extern "C" {
     #[doc = " @return The maximum size of a key we can write"]
     pub fn mdb_env_get_maxkeysize(env: *mut MDB_env) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Set application information associated with the #MDB_env."]
     #[doc = ""]
     #[doc = " @param[in] env An environment handle returned by #mdb_env_create()"]
@@ -660,7 +660,7 @@ extern "C" {
     #[doc = " @return A non-zero error value on failure and 0 on success."]
     pub fn mdb_env_set_userctx(env: *mut MDB_env, ctx: *mut libc::c_void) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Get the application information associated with the #MDB_env."]
     #[doc = ""]
     #[doc = " @param[in] env An environment handle returned by #mdb_env_create()"]
@@ -674,7 +674,7 @@ extern "C" {
 #[doc = " @param[in] msg The assertion message, not including newline."]
 pub type MDB_assert_func =
     ::std::option::Option<unsafe extern "C" fn(env: *mut MDB_env, msg: *const libc::c_char)>;
-extern "C" {
+unsafe extern "C" {
     #[doc = " Set or reset the assert() callback of the environment."]
     #[doc = " Disabled if liblmdb is buillt with NDEBUG."]
     #[doc = " @note This hack should become obsolete as lmdb's error handling matures."]
@@ -683,7 +683,7 @@ extern "C" {
     #[doc = " @return A non-zero error value on failure and 0 on success."]
     pub fn mdb_env_set_assert(env: *mut MDB_env, func: MDB_assert_func) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Create a transaction for use with the environment."]
     #[doc = ""]
     #[doc = " The transaction handle may be discarded using #mdb_txn_abort() or #mdb_txn_commit()."]
@@ -724,13 +724,13 @@ extern "C" {
         txn: *mut *mut MDB_txn,
     ) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Returns the transaction's #MDB_env"]
     #[doc = ""]
     #[doc = " @param[in] txn A transaction handle returned by #mdb_txn_begin()"]
     pub fn mdb_txn_env(txn: *mut MDB_txn) -> *mut MDB_env;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Return the transaction's ID."]
     #[doc = ""]
     #[doc = " This returns the identifier associated with this transaction. For a"]
@@ -741,7 +741,7 @@ extern "C" {
     #[doc = " @return A transaction ID, valid if input is an active transaction."]
     pub fn mdb_txn_id(txn: *mut MDB_txn) -> usize;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Commit all the operations of a transaction into the database."]
     #[doc = ""]
     #[doc = " The transaction handle is freed. It and its cursors must not be used"]
@@ -759,7 +759,7 @@ extern "C" {
     #[doc = " </ul>"]
     pub fn mdb_txn_commit(txn: *mut MDB_txn) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Abandon all the operations of the transaction instead of saving them."]
     #[doc = ""]
     #[doc = " The transaction handle is freed. It and its cursors must not be used"]
@@ -769,7 +769,7 @@ extern "C" {
     #[doc = " @param[in] txn A transaction handle returned by #mdb_txn_begin()"]
     pub fn mdb_txn_abort(txn: *mut MDB_txn);
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Reset a read-only transaction."]
     #[doc = ""]
     #[doc = " Abort the transaction like #mdb_txn_abort(), but keep the transaction"]
@@ -788,7 +788,7 @@ extern "C" {
     #[doc = " @param[in] txn A transaction handle returned by #mdb_txn_begin()"]
     pub fn mdb_txn_reset(txn: *mut MDB_txn);
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Renew a read-only transaction."]
     #[doc = ""]
     #[doc = " This acquires a new reader lock for a transaction handle that had been"]
@@ -804,7 +804,7 @@ extern "C" {
     #[doc = " </ul>"]
     pub fn mdb_txn_renew(txn: *mut MDB_txn) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Open a database in the environment."]
     #[doc = ""]
     #[doc = " A database handle denotes the name and parameters of a database,"]
@@ -879,7 +879,7 @@ extern "C" {
         dbi: *mut MDB_dbi,
     ) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Retrieve statistics for a database."]
     #[doc = ""]
     #[doc = " @param[in] txn A transaction handle returned by #mdb_txn_begin()"]
@@ -893,7 +893,7 @@ extern "C" {
     #[doc = " </ul>"]
     pub fn mdb_stat(txn: *mut MDB_txn, dbi: MDB_dbi, stat: *mut MDB_stat) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Retrieve the DB flags for a database handle."]
     #[doc = ""]
     #[doc = " @param[in] txn A transaction handle returned by #mdb_txn_begin()"]
@@ -906,7 +906,7 @@ extern "C" {
         flags: *mut libc::c_uint,
     ) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Close a database handle. Normally unnecessary. Use with care:"]
     #[doc = ""]
     #[doc = " This call is not mutex protected. Handles should only be closed by"]
@@ -924,7 +924,7 @@ extern "C" {
     #[doc = " @param[in] dbi A database handle returned by #mdb_dbi_open()"]
     pub fn mdb_dbi_close(env: *mut MDB_env, dbi: MDB_dbi);
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Empty or delete+close a database."]
     #[doc = ""]
     #[doc = " See #mdb_dbi_close() for restrictions about closing the DB handle."]
@@ -935,7 +935,7 @@ extern "C" {
     #[doc = " @return A non-zero error value on failure and 0 on success."]
     pub fn mdb_drop(txn: *mut MDB_txn, dbi: MDB_dbi, del: libc::c_int) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Set a custom key comparison function for a database."]
     #[doc = ""]
     #[doc = " The comparison function is called whenever it is necessary to compare a"]
@@ -956,7 +956,7 @@ extern "C" {
     #[doc = " </ul>"]
     pub fn mdb_set_compare(txn: *mut MDB_txn, dbi: MDB_dbi, cmp: MDB_cmp_func) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Set a custom data comparison function for a #MDB_DUPSORT database."]
     #[doc = ""]
     #[doc = " This comparison function is called whenever it is necessary to compare a data"]
@@ -979,7 +979,7 @@ extern "C" {
     #[doc = " </ul>"]
     pub fn mdb_set_dupsort(txn: *mut MDB_txn, dbi: MDB_dbi, cmp: MDB_cmp_func) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Set a relocation function for a #MDB_FIXEDMAP database."]
     #[doc = ""]
     #[doc = " @todo The relocation function is called whenever it is necessary to move the data"]
@@ -999,7 +999,7 @@ extern "C" {
     #[doc = " </ul>"]
     pub fn mdb_set_relfunc(txn: *mut MDB_txn, dbi: MDB_dbi, rel: MDB_rel_func) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Set a context pointer for a #MDB_FIXEDMAP database's relocation function."]
     #[doc = ""]
     #[doc = " See #mdb_set_relfunc and #MDB_rel_func for more details."]
@@ -1019,7 +1019,7 @@ extern "C" {
         ctx: *mut libc::c_void,
     ) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Get items from a database."]
     #[doc = ""]
     #[doc = " This function retrieves key/data pairs from the database. The address"]
@@ -1052,7 +1052,7 @@ extern "C" {
         data: *mut MDB_val,
     ) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Store items into a database."]
     #[doc = ""]
     #[doc = " This function stores key/data pairs in the database. The default behavior"]
@@ -1107,7 +1107,7 @@ extern "C" {
         flags: libc::c_uint,
     ) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Delete items from a database."]
     #[doc = ""]
     #[doc = " This function removes key/data pairs from the database."]
@@ -1136,7 +1136,7 @@ extern "C" {
         data: *mut MDB_val,
     ) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Create a cursor handle."]
     #[doc = ""]
     #[doc = " A cursor is associated with a specific transaction and database."]
@@ -1164,7 +1164,7 @@ extern "C" {
         cursor: *mut *mut MDB_cursor,
     ) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Close a cursor handle."]
     #[doc = ""]
     #[doc = " The cursor handle will be freed and must not be used again after this call."]
@@ -1172,7 +1172,7 @@ extern "C" {
     #[doc = " @param[in] cursor A cursor handle returned by #mdb_cursor_open()"]
     pub fn mdb_cursor_close(cursor: *mut MDB_cursor);
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Renew a cursor handle."]
     #[doc = ""]
     #[doc = " A cursor is associated with a specific transaction and database."]
@@ -1190,19 +1190,19 @@ extern "C" {
     #[doc = " </ul>"]
     pub fn mdb_cursor_renew(txn: *mut MDB_txn, cursor: *mut MDB_cursor) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Return the cursor's transaction handle."]
     #[doc = ""]
     #[doc = " @param[in] cursor A cursor handle returned by #mdb_cursor_open()"]
     pub fn mdb_cursor_txn(cursor: *mut MDB_cursor) -> *mut MDB_txn;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Return the cursor's database handle."]
     #[doc = ""]
     #[doc = " @param[in] cursor A cursor handle returned by #mdb_cursor_open()"]
     pub fn mdb_cursor_dbi(cursor: *mut MDB_cursor) -> MDB_dbi;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Retrieve by cursor."]
     #[doc = ""]
     #[doc = " This function retrieves key/data pairs from the database. The address and length"]
@@ -1228,7 +1228,7 @@ extern "C" {
         op: MDB_cursor_op,
     ) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Store by cursor."]
     #[doc = ""]
     #[doc = " This function stores key/data pairs into the database."]
@@ -1294,7 +1294,7 @@ extern "C" {
         flags: libc::c_uint,
     ) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Delete current key/data pair"]
     #[doc = ""]
     #[doc = " This function deletes the key/data pair to which the cursor refers."]
@@ -1317,7 +1317,7 @@ extern "C" {
     #[doc = " </ul>"]
     pub fn mdb_cursor_del(cursor: *mut MDB_cursor, flags: libc::c_uint) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Return count of duplicates for current key."]
     #[doc = ""]
     #[doc = " This call is only valid on databases that support sorted duplicate"]
@@ -1331,7 +1331,7 @@ extern "C" {
     #[doc = " </ul>"]
     pub fn mdb_cursor_count(cursor: *mut MDB_cursor, countp: *mut usize) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Compare two data items according to a particular database."]
     #[doc = ""]
     #[doc = " This returns a comparison as if the two data items were keys in the"]
@@ -1348,7 +1348,7 @@ extern "C" {
         b: *const MDB_val,
     ) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Compare two data items according to a particular database."]
     #[doc = ""]
     #[doc = " This returns a comparison as if the two items were data items of"]
@@ -1373,7 +1373,7 @@ extern "C" {
 pub type MDB_msg_func = ::std::option::Option<
     unsafe extern "C" fn(msg: *const libc::c_char, ctx: *mut libc::c_void) -> libc::c_int,
 >;
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Dump the entries in the reader lock table."]
     #[doc = ""]
     #[doc = " @param[in] env An environment handle returned by #mdb_env_create()"]
@@ -1386,7 +1386,7 @@ extern "C" {
         ctx: *mut libc::c_void,
     ) -> libc::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " @brief Check for stale entries in the reader lock table."]
     #[doc = ""]
     #[doc = " @param[in] env An environment handle returned by #mdb_env_create()"]
