@@ -6,7 +6,7 @@ use std::ffi::OsStr;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::AtomicU32;
 use std::sync::Mutex;
 use std::{fmt, mem, ptr, result};
 
@@ -42,7 +42,6 @@ pub struct Environment {
     env: *mut ffi::MDB_env,
     tx_count: AtomicU32,
     tx_blocker_count: AtomicU32,
-    tx_blocker_spinlock: AtomicBool,
     db_resize_lock: Mutex<()>,
     dbi_open_mutex: Mutex<()>,
     resize_callback: Option<Box<dyn Fn(DatabaseResizeInfo)>>,
@@ -139,6 +138,8 @@ impl Environment {
         ((current_map_size as u128 * resize_ratio as u128) / 100).try_into().expect("lmdb: Failed to convert headroom value to usize; this means either database configuration is wrong or an invariant is broken")
     }
 
+    /// The caller must hold `db_resize_lock`; the only caller, `begin_rw_txn_generic`, holds it,
+    /// so the resize it drives through `do_resize_locked` shares that single-owner critical section.
     fn resize_db_if_necessary(&self, headroom: Option<usize>) -> Result<()> {
         let resize_settings = self.resize_settings.as_ref().unwrap_or(&DEFAULT_RESIZE_SETTINGS);
 
@@ -149,7 +150,7 @@ impl Environment {
             Self::headroom_from_ratio(initial_map_size, resize_settings.default_resize_ratio_percentage)
         });
         while self.needs_resize(headroom)? {
-            let new_map_size = self.do_resize(Some(required_space))?;
+            let new_map_size = self.do_resize_locked(Some(required_space))?;
             if new_map_size >= required_space + initial_map_size {
                 break;
             }
@@ -214,11 +215,6 @@ impl Environment {
     /// Return the number of requests to block any new transactions, controlled with ScopedTransactionBlocker
     pub(crate) fn tx_blocker_count(&self) -> &AtomicU32 {
         &self.tx_blocker_count
-    }
-
-    /// Return the number of requests to block any new transactions, controlled with ScopedTransactionBlocker
-    pub(crate) fn tx_blocker_spinlock(&self) -> &AtomicBool {
-        &self.tx_blocker_spinlock
     }
 
     /// Closes the database handle. Normally unnecessary.
@@ -359,6 +355,17 @@ impl Environment {
     /// Keep in mind that a single resize step cannot be larger than 1 << 31, due to usize limitations
     /// this is due to the FFI using usize while lmdb uses mdb_size_t, which is always u64
     pub fn do_resize(&self, increase_size: Option<usize>) -> Result<usize> {
+        // - take the resize lock so two remaps can never run concurrently on the same map
+        // - begin_rw_txn_generic already holds this lock when it drives a resize through do_resize_locked,
+        //   so the locked region always has exactly one owner
+        let _lock = self.db_resize_lock.lock().expect("Database resize mutex lock failed");
+        self.do_resize_locked(increase_size)
+    }
+
+    /// The actual resize step, split out so the resize lock is acquired in exactly one place.
+    /// The caller must hold `db_resize_lock`; `do_resize` and `resize_db_if_necessary` are the only
+    /// callers and both hold it, which is what makes the transaction draining below single-owner.
+    fn do_resize_locked(&self, increase_size: Option<usize>) -> Result<usize> {
         let stat = self.stat()?;
         let env_info = self.info()?;
         let system_page_size = stat.page_size() as usize;
@@ -404,16 +411,18 @@ impl Environment {
         );
 
         // Check available disk space
-        let free_space = fs4::free_space(&self.db_path).expect("Failed to get remaining disk space for db resize");
+        // - a failed free-space query is a runtime filesystem error, not a broken invariant, so return it
+        // - route it onto the OS-error channel LMDB already uses; EIO covers the rare io error with no OS code
+        let free_space =
+            fs4::free_space(&self.db_path).map_err(|e| Error::Other(e.raw_os_error().unwrap_or(libc::EIO)))?;
         let final_increase = new_map_size
             .checked_sub(old_map_size)
             .expect("Resize invariant broken: new_map_size < old_map_size") as u64;
-        assert!(
-            free_space > final_increase,
-            "LMDB Database resize failed. Available free disk space {} bytes is not big enough; required: {} bytes",
-            free_space,
-            final_increase
-        );
+        // - refuse to grow past what the disk can back; a full disk is a normal runtime condition, not a panic
+        // - ENOSPC mirrors what the OS itself reports when a mapping cannot be backed by disk
+        if free_space <= final_increase {
+            return Err(Error::Other(libc::ENOSPC));
+        }
 
         // There cannot be any transactions running while resizing
         let _tx_blocker = ScopedTransactionBlocker::new(self);
@@ -609,7 +618,6 @@ impl EnvironmentBuilder {
             env,
             tx_count: AtomicU32::new(0),
             tx_blocker_count: AtomicU32::new(0),
-            tx_blocker_spinlock: AtomicBool::new(false),
             db_resize_lock: Mutex::new(()),
             dbi_open_mutex: Mutex::new(()),
             resize_callback: self.resize_callback,
@@ -681,6 +689,10 @@ impl EnvironmentBuilder {
 
 #[cfg(test)]
 mod test {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
     use std::{collections::BTreeMap, sync::Arc};
 
     use byteorder::{ByteOrder, LittleEndian};
@@ -1174,5 +1186,120 @@ mod test {
 
         // this should work as the function will round up page sizes
         env.do_resize(Some((1 << 17) + 7)).unwrap();
+    }
+
+    fn small_step_resize_settings() -> DatabaseResizeSettings {
+        DatabaseResizeSettings {
+            min_resize_step: 1 << 16,
+            max_resize_step: 1 << 18,
+            default_resize_ratio_percentage: 10,
+            resize_trigger_percentage: 0.9,
+        }
+    }
+
+    // The disk-space guard must return an error, not panic. Request a growth larger than any real disk
+    // (tens of petabytes) so the free-space check fails deterministically on any machine.
+    #[test]
+    fn test_resize_returns_err_when_disk_too_small() {
+        let resize_settings = DatabaseResizeSettings {
+            min_resize_step: 1 << 45,
+            max_resize_step: 1 << 55,
+            default_resize_ratio_percentage: 10,
+            resize_trigger_percentage: 0.9,
+        };
+        let dir = TempDir::new("test").unwrap();
+        let env =
+            Environment::new().set_map_size(1 << 20).set_resize_settings(resize_settings).open(dir.path()).unwrap();
+
+        // no filesystem can back this growth, so the resize returns ENOSPC instead of panicking
+        assert_eq!(env.do_resize(Some(1 << 55)), Err(Error::Other(libc::ENOSPC)));
+    }
+
+    // A reset()+drop must fully release the transaction so a later resize can drain tx_count to zero.
+    // Under the previous count leak the resizer spins forever, so the resize runs on a thread with a bounded wait.
+    #[test]
+    fn test_resize_after_reset_does_not_hang() {
+        let dir = TempDir::new("test").unwrap();
+        let env = Arc::new(
+            Environment::new()
+                .set_map_size(1 << 20)
+                .set_resize_settings(small_step_resize_settings())
+                .open(dir.path())
+                .unwrap(),
+        );
+
+        let txn = env.begin_ro_txn().unwrap();
+        let inactive = txn.reset();
+        drop(inactive);
+        assert_eq!(env.tx_count().load(Ordering::Relaxed), 0);
+
+        let (sender, receiver) = mpsc::channel();
+        let resize_env = Arc::clone(&env);
+        let handle = thread::spawn(move || {
+            let result = resize_env.do_resize(Some(1 << 16));
+            sender.send(result).unwrap();
+        });
+
+        match receiver.recv_timeout(Duration::from_secs(30)) {
+            Ok(Ok(_)) => {},
+            Ok(Err(e)) => panic!("resize after reset returned an error: {}", e),
+            Err(_) => panic!("resize after reset hung: the transaction interlock leaked a count"),
+        }
+        handle.join().unwrap();
+    }
+
+    // Many reader threads open/reset/renew/close read transactions in a loop while the main thread performs
+    // many resizes. Exercises the lock-free interlock under contention; a gross regression shows up as a
+    // panic, a hang, or corrupted reads. Non-deterministic, but a strong smoke test for the handshake.
+    #[test]
+    fn test_concurrent_txn_and_resize_stress() {
+        let dir = TempDir::new("test").unwrap();
+        let env = Arc::new(
+            Environment::new()
+                .set_map_size(1 << 20)
+                .set_resize_settings(small_step_resize_settings())
+                .open(dir.path())
+                .unwrap(),
+        );
+        let db = env.create_db(None, DatabaseFlags::empty()).unwrap();
+
+        {
+            let mut txn = env.begin_rw_txn(None).unwrap();
+            txn.put(db, b"k", b"v", WriteFlags::empty()).unwrap();
+            txn.commit().unwrap();
+        }
+
+        let n_readers = 8usize;
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::with_capacity(n_readers);
+        for _ in 0..n_readers {
+            let reader_env = Arc::clone(&env);
+            let reader_stop = Arc::clone(&stop);
+            handles.push(thread::spawn(move || {
+                while !reader_stop.load(Ordering::Relaxed) {
+                    let txn = reader_env.begin_ro_txn().unwrap();
+                    assert_eq!(b"v", txn.get(db, b"k").unwrap());
+                    // exercise the reset/renew guard-carry paths under the resize storm too
+                    let inactive = txn.reset();
+                    let txn = inactive.renew().unwrap();
+                    assert_eq!(b"v", txn.get(db, b"k").unwrap());
+                    txn.abort();
+                }
+            }));
+        }
+
+        for _ in 0..100 {
+            env.do_resize(Some(1 << 16)).unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // data integrity survives the storm, and every transaction has been accounted for
+        let txn = env.begin_ro_txn().unwrap();
+        assert_eq!(b"v", txn.get(db, b"k").unwrap());
+        txn.abort();
+        assert_eq!(env.tx_count().load(Ordering::Relaxed), 0);
     }
 }

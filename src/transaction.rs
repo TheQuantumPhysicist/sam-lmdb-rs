@@ -148,13 +148,21 @@ impl<'env> RoTransaction<'env> {
     /// Creates a new read-only transaction in the given environment. Prefer
     /// using `Environment::begin_ro_txn`.
     pub(crate) fn new(env: &'env Environment) -> Result<RoTransaction<'env>> {
+        // - acquire the guard BEFORE beginning the txn
+        // - the read-only path holds no resize lock, so a resize on another thread can run concurrently here
+        // - TransactionGuard::new publishes this reader in tx_count and waits out any pending resize, so the
+        //   txn is begun and used entirely while a concurrent resizer is pinned waiting for tx_count to drain
+        // - beginning first (the previous order) let a resize remap the map out from under a just-begun txn,
+        //   a use-after-munmap; the write path is instead serialized by db_resize_lock, so it keeps its order
+        let guard = TransactionGuard::new(env);
         let mut txn = ptr::null_mut();
         unsafe {
+            // - on begin failure the guard drops on this early return, releasing the published tx_count
             lmdb_result(ffi::mdb_txn_begin(env.env(), ptr::null_mut(), ffi::MDB_RDONLY, &mut txn))?;
             Ok(RoTransaction {
                 txn,
                 env,
-                _guard: TransactionGuard::new(env),
+                _guard: guard,
                 _marker: PhantomData,
             })
         }
@@ -175,13 +183,17 @@ impl<'env> RoTransaction<'env> {
     pub fn reset(self) -> InactiveTransaction<'env> {
         let txn = self.txn;
         let env = self.env;
-        unsafe {
-            mem::forget(self);
-            ffi::mdb_txn_reset(txn)
-        };
+        // - RoTransaction implements Drop, so its fields cannot be moved out individually
+        // - copy the guard out by raw read, then forget self so its Drop (txn abort plus guard drop) never runs
+        // - carrying the guard forward keeps the transaction's tx_count contribution alive across the reset,
+        //   instead of leaking it (the old code forgot the guard and never decremented tx_count)
+        let guard = unsafe { ptr::read(&self._guard) };
+        mem::forget(self);
+        unsafe { ffi::mdb_txn_reset(txn) };
         InactiveTransaction {
             txn,
             env,
+            _guard: guard,
             _marker: PhantomData,
         }
     }
@@ -207,6 +219,10 @@ impl<'env> private::TransactionSealedProps for RoTransaction<'env> {
 pub struct InactiveTransaction<'env> {
     txn: *mut ffi::MDB_txn,
     env: &'env Environment,
+    // - the guard carried over from the active transaction that was reset
+    // - keeps this transaction's tx_count contribution alive while it is inactive
+    // - dropped exactly once at final close (or moved back out by renew), never re-created
+    _guard: TransactionGuard<'env>,
     _marker: PhantomData<&'env ()>,
 }
 
@@ -231,14 +247,23 @@ impl<'env> InactiveTransaction<'env> {
     pub fn renew(self) -> Result<RoTransaction<'env>> {
         let txn = self.txn;
         let env = self.env;
-        unsafe {
-            mem::forget(self);
-            lmdb_result(ffi::mdb_txn_renew(txn))?
-        };
+        // - InactiveTransaction implements Drop, so read the carried guard out by pointer, then forget self
+        // - renew reuses that guard rather than calling TransactionGuard::new; a new one would double-count tx_count
+        // - the guard stays held throughout, so tx_count never returns to zero for this logical transaction,
+        //   which keeps a concurrent resizer pinned and prevents renewing against a mapping being remapped
+        let guard = unsafe { ptr::read(&self._guard) };
+        mem::forget(self);
+        if let Err(e) = unsafe { lmdb_result(ffi::mdb_txn_renew(txn)) } {
+            // - renew failed and the transaction is abandoned
+            // - LMDB does not free the handle on a failed renew, so abort it here to avoid leaking it
+            // - the local guard drops at this early return, releasing this transaction's tx_count contribution
+            unsafe { ffi::mdb_txn_abort(txn) };
+            return Err(e);
+        }
         Ok(RoTransaction {
             txn,
             env,
-            _guard: TransactionGuard::new(env),
+            _guard: guard,
             _marker: PhantomData,
         })
     }
@@ -458,6 +483,7 @@ impl<'env> private::TransactionSealedProps for RwTransaction<'env> {
 mod test {
 
     use std::io::Write;
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Barrier};
     use std::thread::{self, JoinHandle};
 
@@ -573,6 +599,45 @@ mod test {
         let inactive = txn.reset();
         let active = inactive.renew().unwrap();
         assert!(active.get(db, b"key").is_ok());
+    }
+
+    // Regression test: reset() used to forget the transaction guard, permanently leaking +1 on tx_count.
+    // The guard is the only place tx_count is decremented, so a leaked guard makes a later resize spin forever.
+    #[test]
+    fn test_reset_then_drop_does_not_leak_tx_count() {
+        let dir = TempDir::new("test").unwrap();
+        let env = Environment::new().open(dir.path()).unwrap();
+
+        assert_eq!(env.tx_count().load(Ordering::Relaxed), 0);
+        let txn = env.begin_ro_txn().unwrap();
+        assert_eq!(env.tx_count().load(Ordering::Relaxed), 1);
+
+        let inactive = txn.reset();
+        // reset carries the count into the inactive state; it must neither drop nor leak it
+        assert_eq!(env.tx_count().load(Ordering::Relaxed), 1);
+
+        drop(inactive);
+        // dropping the inactive transaction releases the carried count exactly once
+        assert_eq!(env.tx_count().load(Ordering::Relaxed), 0);
+    }
+
+    // Regression test: renew() used to call TransactionGuard::new again, double-counting tx_count.
+    // A full begin -> reset -> renew -> close cycle must net to zero, holding at exactly one throughout.
+    #[test]
+    fn test_reset_renew_keeps_tx_count_balanced() {
+        let dir = TempDir::new("test").unwrap();
+        let env = Environment::new().open(dir.path()).unwrap();
+
+        let txn = env.begin_ro_txn().unwrap();
+        let inactive = txn.reset();
+        assert_eq!(env.tx_count().load(Ordering::Relaxed), 1);
+
+        let active = inactive.renew().unwrap();
+        // renew reuses the carried guard; it must not add a second count
+        assert_eq!(env.tx_count().load(Ordering::Relaxed), 1);
+
+        drop(active);
+        assert_eq!(env.tx_count().load(Ordering::Relaxed), 0);
     }
 
     #[test]
