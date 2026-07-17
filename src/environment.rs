@@ -184,6 +184,10 @@ impl Environment {
         no_sync: bool,
         no_meta_sync: bool,
     ) -> Result<RwTransaction<'_>> {
+        // - the expect covers poisoning only, which means another thread panicked mid-resize and left
+        //   the map in an unknown state: a broken invariant, not a runtime condition to hand back
+        // - returning it instead is not expressible: Error carries an OS errno and has no poison
+        //   variant, so propagating would mean inventing an errno the OS never reported
         let _lock = self.db_resize_lock.lock().expect("Database resize mutex lock failed");
         self.resize_db_if_necessary(headroom)?;
         RwTransaction::new(self, no_sync, no_meta_sync)
@@ -304,7 +308,14 @@ impl Environment {
     ///
     /// Note:
     ///
-    /// * No active transactions allowed when performing resizing in this process.
+    /// * Transactions live in this process are waited out before the map is replaced, so this
+    ///   blocks until they finish. Two caller shapes dead-lock against that wait, both of them
+    ///   reachable through `do_resize` as well:
+    ///   1. The *calling* thread holds a transaction. That transaction can never drain, because
+    ///      dropping it is exactly what this call is waiting for.
+    ///   2. *Any* thread opens a transaction while it already holds one (`begin_nested_txn`
+    ///      included). The second open parks until this resize finishes, while this resize waits
+    ///      for the transaction that same thread is still holding.
     ///
     /// * The size should be a multiple of the OS page size. Any attempt to set
     ///   a size smaller than the space already consumed by the environment will
@@ -315,6 +326,30 @@ impl Environment {
     ///   with size 0 to update the environment. Otherwise, new transaction creation
     ///   will fail with `Error::MapResized`.
     pub fn set_map_size(&self, size: size_t) -> Result<()> {
+        // - take the resize lock so this remap cannot interleave with one driven by do_resize or by
+        //   begin_rw_txn_generic; mdb_env_set_mapsize is not safe to run against itself
+        // - the expect covers poisoning only, which means another thread panicked mid-resize and left
+        //   the map in an unknown state: a broken invariant, not a runtime condition to hand back
+        // - returning it instead is not expressible: Error carries an OS errno and has no poison
+        //   variant, so propagating would mean inventing an errno the OS never reported
+        let _lock = self.db_resize_lock.lock().expect("Database resize mutex lock failed");
+        self.set_map_size_locked(size)
+    }
+
+    /// The only place the memory map is replaced, so the interlock that makes replacing it safe is
+    /// stated once here instead of at each call site, where a caller could omit it.
+    /// The caller must hold `db_resize_lock`; `set_map_size` and `do_resize_locked` are the only
+    /// callers and both hold it. That is also what keeps the blocker below single-owner: every
+    /// blocker in the crate is created from here, hence always under that lock.
+    fn set_map_size_locked(&self, size: size_t) -> Result<()> {
+        // - mdb_env_set_mapsize unmaps the file and maps it again, normally at a different address,
+        //   so any slice a live transaction handed out would be left dangling
+        // - LMDB itself only refuses this while a write transaction is open; read transactions are
+        //   invisible to it, so excluding them is on us
+        // - blocking new transactions and draining the live ones is what closes that window
+        let _tx_blocker = ScopedTransactionBlocker::new(self);
+        TransactionGuard::wait_for_transactions_to_finish(self);
+
         unsafe { lmdb_result(ffi::mdb_env_set_mapsize(self.env(), size)) }
     }
 
@@ -350,14 +385,20 @@ impl Environment {
         Ok(current_percentage_used > resize_settings.resize_trigger_percentage)
     }
 
-    /// Do the resizing. This will pause all transactions (or will dead-lock), then resize,
-    /// and return the new map size.
+    /// Do the resizing. This blocks until every transaction live in this process has finished, then
+    /// resizes, and returns the new map size. The same two caller shapes that dead-lock
+    /// `set_map_size` dead-lock here, for the same reason: a transaction held on the *calling*
+    /// thread, or *any* thread opening a transaction while it already holds one.
     /// Keep in mind that a single resize step cannot be larger than 1 << 31, due to usize limitations
     /// this is due to the FFI using usize while lmdb uses mdb_size_t, which is always u64
     pub fn do_resize(&self, increase_size: Option<usize>) -> Result<usize> {
         // - take the resize lock so two remaps can never run concurrently on the same map
         // - begin_rw_txn_generic already holds this lock when it drives a resize through do_resize_locked,
         //   so the locked region always has exactly one owner
+        // - the expect covers poisoning only, which means another thread panicked mid-resize and left
+        //   the map in an unknown state: a broken invariant, not a runtime condition to hand back
+        // - returning it instead is not expressible: Error carries an OS errno and has no poison
+        //   variant, so propagating would mean inventing an errno the OS never reported
         let _lock = self.db_resize_lock.lock().expect("Database resize mutex lock failed");
         self.do_resize_locked(increase_size)
     }
@@ -424,11 +465,9 @@ impl Environment {
             return Err(Error::Other(libc::ENOSPC));
         }
 
-        // There cannot be any transactions running while resizing
-        let _tx_blocker = ScopedTransactionBlocker::new(self);
-        TransactionGuard::wait_for_transactions_to_finish(self);
-
-        self.set_map_size(new_map_size)?;
+        // - excluding live transactions is part of replacing the map, so it lives in set_map_size_locked
+        // - the locked variant is the one called here because this function already holds db_resize_lock
+        self.set_map_size_locked(new_map_size)?;
 
         if let Some(resize_callback) = &self.resize_callback {
             resize_callback(DatabaseResizeInfo {
@@ -673,7 +712,15 @@ impl EnvironmentBuilder {
         self
     }
 
-    /// Set the function that will be called when a database resize happens
+    /// Set the function that will be called when a database resize happens.
+    ///
+    /// The callback runs on whichever thread drove the resize, and that thread still holds the
+    /// environment's internal resize lock while the callback runs. That lock is not reentrant, so
+    /// calling `set_map_size`, `do_resize`, or `begin_rw_txn` from inside the callback dead-locks the
+    /// callback's own thread against itself.
+    ///
+    /// Opening a read transaction with `begin_ro_txn` is allowed: the map has already been replaced
+    /// by the time the callback runs, and the block on new transactions is lifted before the call.
     pub fn set_resize_callback(mut self, callback: Option<Box<dyn Fn(DatabaseResizeInfo)>>) -> EnvironmentBuilder {
         self.resize_callback = callback;
         self
@@ -689,13 +736,16 @@ impl EnvironmentBuilder {
 
 #[cfg(test)]
 mod test {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
+    use std::sync::{OnceLock, Weak};
     use std::thread;
     use std::time::Duration;
     use std::{collections::BTreeMap, sync::Arc};
 
     use byteorder::{ByteOrder, LittleEndian};
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
     use tempdir::TempDir;
 
     use crate::flags::*;
@@ -881,6 +931,136 @@ mod test {
         env.set_map_size(2 * default_size).unwrap();
         info = env.info().unwrap();
         assert_eq!(info.map_size(), 2 * default_size);
+    }
+
+    // - resizing replaces the memory map: the old one is unmapped, a new one mapped at a new address
+    // - a read transaction hands out &[u8] that point straight into that map
+    // - so a resize running next to a live reader leaves the reader holding dangling pointers
+    // - LMDB only refuses a resize while a write transaction is open, so readers are invisible to it
+    // - set_map_size used to remap with no interlock, reachable from safe code with a shared &Environment
+    // - set_map_size now drains live transactions first, exactly like do_resize
+    // - what is asserted is the interlock, not the corruption: the resize must not return while a
+    //   reader is still live
+    // - against the uninterlocked version the resize returns immediately, or the reader segfaults
+    //   reading through the freed mapping
+    #[test]
+    fn test_set_map_size_waits_for_live_reader() {
+        const READER_HOLD: Duration = Duration::from_millis(200);
+
+        let dir = TempDir::new("test").unwrap();
+        let env = Arc::new(Environment::new().set_map_size(1 << 20).open(dir.path()).unwrap());
+        let db = env.create_db(None, DatabaseFlags::empty()).unwrap();
+
+        let value = vec![0xABu8; 4096];
+        {
+            let mut txn = env.begin_rw_txn(None).unwrap();
+            txn.put(db, b"k", &value, WriteFlags::empty()).unwrap();
+            txn.commit().unwrap();
+        }
+
+        let reader_live = Arc::new(AtomicBool::new(false));
+        let reader_finished = Arc::new(AtomicBool::new(false));
+
+        let reader_env = Arc::clone(&env);
+        let reader_live_flag = Arc::clone(&reader_live);
+        let reader_finished_flag = Arc::clone(&reader_finished);
+        let expected = value.clone();
+        let reader = thread::spawn(move || {
+            let txn = reader_env.begin_ro_txn().unwrap();
+            // borrows straight into the memory map that the resizer is about to replace
+            let mapped: &[u8] = txn.get(db, b"k").unwrap();
+            reader_live_flag.store(true, Ordering::SeqCst);
+            thread::sleep(READER_HOLD);
+            // reading through the slice after a racing resize is the use-after-unmap
+            assert_eq!(mapped, expected.as_slice(), "reader observed a mapping replaced underneath it");
+            // published before the transaction guard is released, so a resizer that waited for this
+            // reader to drain is guaranteed to observe it
+            reader_finished_flag.store(true, Ordering::SeqCst);
+            txn.abort();
+        });
+
+        while !reader_live.load(Ordering::SeqCst) {
+            thread::yield_now();
+        }
+        env.set_map_size(4 << 20).unwrap();
+        assert!(
+            reader_finished.load(Ordering::SeqCst),
+            "set_map_size replaced the memory map while a read transaction was still live"
+        );
+
+        reader.join().unwrap();
+    }
+
+    // - randomized companion to test_set_map_size_waits_for_live_reader
+    // - covers the input space that matters: reader count, how long each reader holds its slice,
+    //   the stored value, and the target map size
+    #[test]
+    fn test_set_map_size_waits_for_live_readers_randomized() {
+        // Seed is printed so a failing run can be replayed by hardcoding it.
+        let seed: u64 = rand::random();
+        println!("test_set_map_size_waits_for_live_readers_randomized seed: {seed}");
+        // Replaying a hardcoded seed is valid only while rand stays pinned to
+        // 0.8; StdRng's algorithm is not stable across rand major versions.
+        // A replay reproduces the RNG-derived inputs only, not the thread interleaving, which no
+        // seed controls; that is inherent to a concurrency test.
+        let mut rng = StdRng::seed_from_u64(seed);
+
+        for round in 0..4u32 {
+            let n_readers = rng.gen_range(1..=6usize);
+            let hold = Duration::from_millis(rng.gen_range(50..=150));
+            let new_map_size = rng.gen_range(2..=8usize) * (1usize << 20);
+            let value_len = rng.gen_range(1..=4096usize);
+            let value: Vec<u8> = (0..value_len).map(|_| rng.gen::<u8>()).collect();
+
+            let dir = TempDir::new("test").unwrap();
+            let env = Arc::new(Environment::new().set_map_size(1 << 20).open(dir.path()).unwrap());
+            let db = env.create_db(None, DatabaseFlags::empty()).unwrap();
+            {
+                let mut txn = env.begin_rw_txn(None).unwrap();
+                txn.put(db, b"k", &value, WriteFlags::empty()).unwrap();
+                txn.commit().unwrap();
+            }
+
+            let readers_live = Arc::new(AtomicUsize::new(0));
+            let readers_finished = Arc::new(AtomicUsize::new(0));
+            let mut handles = Vec::with_capacity(n_readers);
+            for _ in 0..n_readers {
+                let reader_env = Arc::clone(&env);
+                let live = Arc::clone(&readers_live);
+                let finished = Arc::clone(&readers_finished);
+                let expected = value.clone();
+                handles.push(thread::spawn(move || {
+                    let txn = reader_env.begin_ro_txn().unwrap();
+                    // borrows straight into the memory map that the resizer is about to replace
+                    let mapped: &[u8] = txn.get(db, b"k").unwrap();
+                    live.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(hold);
+                    assert_eq!(
+                        mapped,
+                        expected.as_slice(),
+                        "seed {seed}, round {round}: reader observed a mapping replaced underneath it"
+                    );
+                    // published before the transaction guard is released, so a resizer that drained
+                    // this reader is guaranteed to observe it
+                    finished.fetch_add(1, Ordering::SeqCst);
+                    txn.abort();
+                }));
+            }
+
+            while readers_live.load(Ordering::SeqCst) != n_readers {
+                thread::yield_now();
+            }
+            env.set_map_size(new_map_size).unwrap();
+            let still_live = n_readers - readers_finished.load(Ordering::SeqCst);
+            assert_eq!(
+                still_live, 0,
+                "seed {seed}, round {round}: set_map_size replaced the memory map while {still_live} reader(s) were still live"
+            );
+
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        }
     }
 
     #[must_use]
@@ -1248,6 +1428,57 @@ mod test {
         handle.join().unwrap();
     }
 
+    // - the resize callback runs once the map has been replaced and once the block on new transactions
+    //   has been lifted, so a callback is free to open a read transaction
+    // - while that block covered the whole resize, this dead-locked: the callback's own thread waited
+    //   for a block that only that same thread could lift
+    // - so this pins the block to its narrow scope; widening it back over the callback fails here
+    // - the resize runs on its own thread with a bounded wait, so such a regression fails this test
+    //   instead of hanging the suite forever
+    #[test]
+    fn test_resize_callback_can_open_ro_txn() {
+        let dir = TempDir::new("test").unwrap();
+
+        // - the callback is owned by the Environment, so it cannot own one back
+        // - a Weak published after construction breaks that cycle and still reaches the environment
+        let env_slot: Arc<OnceLock<Weak<Environment>>> = Arc::new(OnceLock::new());
+        let callback_slot = Arc::clone(&env_slot);
+        let callback_opened_txn = Arc::new(AtomicBool::new(false));
+        let callback_flag = Arc::clone(&callback_opened_txn);
+        let callback = Box::new(move |_info: DatabaseResizeInfo| {
+            let env = callback_slot.get().unwrap().upgrade().unwrap();
+            // waits forever if the resize still blocks new transactions this late
+            let txn = env.begin_ro_txn().unwrap();
+            txn.abort();
+            callback_flag.store(true, Ordering::SeqCst);
+        });
+
+        let env = Arc::new(
+            Environment::new()
+                .set_map_size(1 << 20)
+                .set_resize_settings(small_step_resize_settings())
+                .set_resize_callback(Some(callback))
+                .open(dir.path())
+                .unwrap(),
+        );
+        // published before any resize can run, so the callback always finds it
+        env_slot.set(Arc::downgrade(&env)).unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        let resize_env = Arc::clone(&env);
+        let handle = thread::spawn(move || {
+            sender.send(resize_env.do_resize(Some(1 << 16))).unwrap();
+        });
+
+        match receiver.recv_timeout(Duration::from_secs(30)) {
+            Ok(Ok(_)) => {},
+            Ok(Err(e)) => panic!("resize with a callback returned an error: {}", e),
+            Err(_) => panic!("resize callback hung: it could not open a read transaction"),
+        }
+        handle.join().unwrap();
+        assert!(callback_opened_txn.load(Ordering::SeqCst), "the resize callback never ran");
+    }
+
     // Many reader threads open/reset/renew/close read transactions in a loop while the main thread performs
     // many resizes. Exercises the lock-free interlock under contention; a gross regression shows up as a
     // panic, a hang, or corrupted reads. Non-deterministic, but a strong smoke test for the handshake.
@@ -1288,8 +1519,15 @@ mod test {
             }));
         }
 
-        for _ in 0..100 {
-            env.do_resize(Some(1 << 16)).unwrap();
+        // - alternate the two public resize entry points, which take the resize lock by different routes
+        // - do_resize takes it and computes the new size; set_map_size takes it and remaps to a size we pick
+        for i in 0..100 {
+            if i % 2 == 0 {
+                env.do_resize(Some(1 << 16)).unwrap();
+            } else {
+                let current_map_size = env.info().unwrap().map_size();
+                env.set_map_size(current_map_size + (1 << 16)).unwrap();
+            }
         }
         stop.store(true, Ordering::Relaxed);
         for handle in handles {
