@@ -19,7 +19,47 @@ pub trait Cursor<'txn>: Sized {
 
     /// Retrieves a key/data pair from the cursor. Depending on the cursor op,
     /// the current key may be returned.
-    fn get(&self, key: Option<&[u8]>, data: Option<&[u8]>, op: c_uint) -> Result<(Option<&'txn [u8]>, &'txn [u8])> {
+    ///
+    /// The LMDB C header states the lifetime contract for every value the
+    /// database hands back, on `MDB_val`:
+    ///
+    /// > Values returned from the database are valid only until a subsequent
+    /// > update operation, or the end of the transaction. Do not modify or
+    /// > free them, they commonly point into the database itself.
+    ///
+    /// - The returned bytes are not a copy. They point straight into LMDB's
+    ///   memory map.
+    /// - That contract has two expiry conditions, whichever comes first: a
+    ///   subsequent update operation, or the end of the transaction.
+    /// - Borrowing `&self` (the cursor) is what encodes the first condition.
+    ///   `put` and `del` take `&mut self`, so the borrow checker refuses to let
+    ///   a returned slice survive a mutation made through the same cursor.
+    /// - Borrowing the transaction instead would encode only the second
+    ///   condition. This signature avoids that on purpose: it would promise more
+    ///   than LMDB delivers, and a `del` would leave a live slice pointing at
+    ///   bytes that have already been moved.
+    /// - Moving a cursor is not an update operation, so slices from earlier
+    ///   positioning calls stay valid across later ones and may be held
+    ///   together. That is why positioning takes a shared borrow.
+    ///
+    /// ```compile_fail,E0502
+    /// use lmdb::{Cursor, Environment, Transaction, WriteFlags};
+    /// use lmdb_sys::MDB_GET_CURRENT;
+    ///
+    /// let dir = tempdir::TempDir::new("doctest").unwrap();
+    /// let env = Environment::new().open(dir.path()).unwrap();
+    /// let db = env.open_db(None).unwrap();
+    /// let mut txn = env.begin_rw_txn(None).unwrap();
+    /// let mut cursor = txn.open_rw_cursor(db).unwrap();
+    /// cursor.put(b"key", b"val", WriteFlags::empty()).unwrap();
+    ///
+    /// let (_key, value) = cursor.get(None, None, MDB_GET_CURRENT).unwrap();
+    /// // Mutating the same cursor may free or overwrite the page `value` points at.
+    /// cursor.put(b"key2", b"val2", WriteFlags::empty()).unwrap();
+    /// // Using `value` after the mutation is rejected: it borrows the cursor.
+    /// println!("{:?}", value);
+    /// ```
+    fn get<'a>(&'a self, key: Option<&[u8]>, data: Option<&[u8]>, op: c_uint) -> Result<(Option<&'a [u8]>, &'a [u8])> {
         unsafe {
             let mut key_val = slice_to_val(key);
             let mut data_val = slice_to_val(data);
@@ -66,7 +106,7 @@ pub trait Cursor<'txn>: Sized {
     {
         match self.get(Some(key.as_ref()), None, ffi::MDB_SET_RANGE) {
             Ok(_) | Err(Error::NotFound) => (),
-            Err(error) => return Iter::Err(error),
+            Err(error) => return Iter::err(error),
         };
         Iter::new(self, ffi::MDB_GET_CURRENT, ffi::MDB_NEXT)
     }
@@ -117,9 +157,9 @@ pub trait Cursor<'txn>: Sized {
                 Ok(_) => Iter::new(self, ffi::MDB_PREV, ffi::MDB_PREV),
                 // Every key is smaller than the request: start from the last key.
                 Err(Error::NotFound) => Iter::new(self, ffi::MDB_LAST, ffi::MDB_PREV),
-                Err(error) => Iter::Err(error),
+                Err(error) => Iter::err(error),
             },
-            Err(error) => Iter::Err(error),
+            Err(error) => Iter::err(error),
         }
     }
 
@@ -134,7 +174,7 @@ pub trait Cursor<'txn>: Sized {
                 self.get(None, None, ffi::MDB_LAST).ok();
                 return Iter::new(self, ffi::MDB_NEXT, ffi::MDB_NEXT);
             },
-            Err(error) => return Iter::Err(error),
+            Err(error) => return Iter::err(error),
         };
         Iter::new(self, ffi::MDB_GET_CURRENT, ffi::MDB_NEXT_DUP)
     }
@@ -225,6 +265,21 @@ impl<'txn> RwCursor<'txn> {
 
     /// Puts a key/data pair into the database. The cursor will be positioned at
     /// the new data item, or on failure usually near it.
+    ///
+    /// ### Position after a put, when walking
+    ///
+    /// - A put moves the cursor onto the item it just wrote, wherever that key
+    ///   sorts. A walk in progress does not resume where it left off, it resumes
+    ///   from the new item. Inserting a key that sorts after the current
+    ///   position therefore skips everything in between, silently.
+    /// - `WriteFlags::CURRENT` overwrites the item the cursor already sits on
+    ///   and leaves the position alone, so it is the flag to use for changing
+    ///   values during a walk.
+    /// - To insert unrelated keys while walking, finish the walk first and
+    ///   insert afterward. There is no flag that keeps a walk intact across an
+    ///   insert somewhere else.
+    /// - This is the opposite of `del`, which LMDB compensates for so a walk
+    ///   continues correctly. See the position contract on [`RwCursor::del`].
     pub fn put<K, D>(&mut self, key: &K, data: &D, flags: WriteFlags) -> Result<()>
     where
         K: AsRef<[u8]>,
@@ -249,8 +304,103 @@ impl<'txn> RwCursor<'txn> {
     ///
     /// `WriteFlags::NO_DUP_DATA` may be used to delete all data items for the
     /// current key, if the database was opened with `DatabaseFlags::DUP_SORT`.
+    ///
+    /// ### Position after a delete
+    ///
+    /// - A delete leaves the cursor on the item that followed the deleted one.
+    ///   A following `next` returns that item instead of skipping it, and a
+    ///   following `prev` needs no compensation. Do not hand-roll a corrective
+    ///   step around a delete; it would skip or repeat an item.
+    /// - The reason: removing an item shifts the rest of the page down into its
+    ///   slot, so the cursor's stored index already denotes the next item. LMDB
+    ///   records that a delete happened and has the next step consume the shift
+    ///   rather than advance again (mdb.c, `mdb_cursor_next`, the `C_DEL`
+    ///   branch near line 6849).
+    /// - This matches erasing through an iterator in C++, where the erase call
+    ///   returns an iterator to the following element. LMDB keeps the same idea
+    ///   as internal state instead of returning it, which makes the behavior
+    ///   invisible from this API and easy to compensate for twice.
+    ///
+    /// ```compile_fail,E0502
+    /// use lmdb::{Environment, Transaction, WriteFlags};
+    ///
+    /// let dir = tempdir::TempDir::new("doctest").unwrap();
+    /// let env = Environment::new().open(dir.path()).unwrap();
+    /// let db = env.open_db(None).unwrap();
+    /// let mut txn = env.begin_rw_txn(None).unwrap();
+    /// txn.put(db, b"key", b"val", WriteFlags::empty()).unwrap();
+    /// let mut cursor = txn.open_rw_cursor(db).unwrap();
+    ///
+    /// let (_key, value) = cursor.next().unwrap().unwrap();
+    /// // The delete closes the hole by moving the page's remaining bytes over
+    /// // the ones `value` points at.
+    /// cursor.del(WriteFlags::empty()).unwrap();
+    /// // Using `value` after the delete is rejected: it borrows the cursor.
+    /// println!("{:?}", value);
+    /// ```
     pub fn del(&mut self, flags: WriteFlags) -> Result<()> {
         unsafe { lmdb_result(ffi::mdb_cursor_del(self.cursor(), flags.bits())) }
+    }
+
+    /// Positions the cursor on the first item of the database and returns it.
+    ///
+    /// - Returns `Ok(None)` when the database holds no items.
+    /// - The returned slices borrow the cursor and expire on the next `put` or
+    ///   `del` through it. See [`Cursor::get`] for the LMDB contract behind
+    ///   that.
+    pub fn first(&self) -> Result<Option<(&[u8], &[u8])>> {
+        self.walk(ffi::MDB_FIRST)
+    }
+
+    /// Positions the cursor on the last item of the database and returns it.
+    ///
+    /// - Returns `Ok(None)` when the database holds no items.
+    /// - The returned slices borrow the cursor, as described on
+    ///   [`Cursor::get`].
+    pub fn last(&self) -> Result<Option<(&[u8], &[u8])>> {
+        self.walk(ffi::MDB_LAST)
+    }
+
+    /// Advances the cursor to the next item and returns it.
+    ///
+    /// - Starts at the first item when the cursor has not been positioned yet.
+    /// - Returns `Ok(None)` at the end of the database.
+    /// - After a `del` this returns the item that followed the deleted one. See
+    ///   the position contract on [`RwCursor::del`].
+    /// - The returned slices borrow the cursor, as described on
+    ///   [`Cursor::get`].
+    pub fn next(&self) -> Result<Option<(&[u8], &[u8])>> {
+        self.walk(ffi::MDB_NEXT)
+    }
+
+    /// Moves the cursor to the previous item and returns it.
+    ///
+    /// - Starts at the last item when the cursor has not been positioned yet.
+    /// - Returns `Ok(None)` at the start of the database.
+    /// - The returned slices borrow the cursor, as described on
+    ///   [`Cursor::get`].
+    pub fn prev(&self) -> Result<Option<(&[u8], &[u8])>> {
+        self.walk(ffi::MDB_PREV)
+    }
+
+    // - Shared borrow, not `&mut`: a move is not an update operation under the
+    //   LMDB contract quoted on `Cursor::get`, so several returned items may be
+    //   held at once. Only `put` and `del` take `&mut self` and expire them.
+    fn walk(&self, op: c_uint) -> Result<Option<(&[u8], &[u8])>> {
+        match self.get(None, None, op) {
+            Ok((key, data)) => {
+                // - Given no input key, LMDB writes the landing key into the out
+                //   value for every positioning op used here, so success always
+                //   carries one.
+                // - No fallible alternative fits: an absent key would mean LMDB
+                //   broke its own contract, not a condition a caller can act on.
+                let key = key.expect("LMDB reports the landing key when given no input key");
+                Ok(Some((key, data)))
+            },
+            // A walk that runs past either end is an ordinary end, not a failure.
+            Err(Error::NotFound) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -272,7 +422,21 @@ unsafe fn val_to_slice<'a>(val: ffi::MDB_val) -> &'a [u8] {
 }
 
 /// An iterator over the key/value pairs in an LMDB database.
-pub enum Iter<'txn, C> {
+///
+/// - The iterator owns its cursor and keeps it unreachable on purpose. The items
+///   it yields borrow the transaction, not the cursor, so a `put` or `del`
+///   through that cursor would expire them while the borrow checker still
+///   accepts them.
+/// - `into_cursor` hands the cursor back for read-only cursors only, which have
+///   no `put` or `del`. Reaching the cursor by any other route would defeat that
+///   restriction, so the state below is private rather than a public enum: a
+///   public enum has no per-field privacy, and its fields could simply be
+///   destructured out.
+pub struct Iter<'txn, C> {
+    inner: IterInner<'txn, C>,
+}
+
+enum IterInner<'txn, C> {
     /// An iterator that returns an error on every call to Iter.next().
     /// Cursor.iter*() creates an Iter of this type when LMDB returns an error
     /// on retrieval of a cursor.  Using this variant instead of returning
@@ -297,33 +461,85 @@ pub enum Iter<'txn, C> {
         /// A marker to ensure the iterator doesn't outlive the transaction.
         _marker: PhantomData<fn(&'txn ())>,
     },
-
-    /// Used to hold an empty result of an iterator
-    Empty,
 }
 
 impl<'txn, C: Cursor<'txn>> Iter<'txn, C> {
     /// Creates a new iterator backed by the given cursor.
     fn new<'t>(cursor: C, op: c_uint, next_op: c_uint) -> Iter<'t, C> {
-        Iter::Ok {
-            cursor,
-            op,
-            next_op,
-            _marker: PhantomData,
+        Iter {
+            inner: IterInner::Ok {
+                cursor,
+                op,
+                next_op,
+                _marker: PhantomData,
+            },
         }
     }
 
-    /// create a cursor starting from the current iterator state
-    pub fn into_cursor(self) -> Result<C> {
-        match self {
-            Iter::Err(err) => Err(err),
-            Iter::Ok {
+    /// Creates an iterator that reports the given error on the first `next`.
+    fn err<'t>(error: Error) -> Iter<'t, C> {
+        Iter {
+            inner: IterInner::Err(error),
+        }
+    }
+}
+
+impl<'txn> Iter<'txn, RoCursor<'txn>> {
+    /// Reclaims the cursor, left where the iteration stopped.
+    ///
+    /// - Offered for read-only cursors only, on purpose. This is the sole way
+    ///   to get a cursor back out of a live iterator, and the iterator's items
+    ///   borrow the transaction rather than the cursor. Handing back a
+    ///   read-write cursor would allow a `put` or `del` that expires those items
+    ///   while the borrow checker still accepts them.
+    /// - A read-only cursor has no `put` or `del`, so reclaiming one cannot
+    ///   invalidate anything.
+    ///
+    /// ```compile_fail,E0599
+    /// use lmdb::{Cursor, Environment, Transaction, WriteFlags};
+    ///
+    /// let dir = tempdir::TempDir::new("doctest").unwrap();
+    /// let env = Environment::new().open(dir.path()).unwrap();
+    /// let db = env.open_db(None).unwrap();
+    /// let mut txn = env.begin_rw_txn(None).unwrap();
+    /// txn.put(db, b"key", b"val", WriteFlags::empty()).unwrap();
+    ///
+    /// let cursor = txn.open_rw_cursor(db).unwrap();
+    /// let iter = cursor.into_iter();
+    /// // Rejected: a read-write cursor cannot be reclaimed mid-iteration.
+    /// let cursor = iter.into_cursor().unwrap();
+    /// ```
+    ///
+    /// Reaching past this method to lift the cursor out by hand is rejected too,
+    /// which is what keeps the restriction above meaningful:
+    ///
+    /// ```compile_fail,E0223
+    /// use lmdb::{Cursor, Environment, Transaction, WriteFlags};
+    ///
+    /// let dir = tempdir::TempDir::new("doctest").unwrap();
+    /// let env = Environment::new().open(dir.path()).unwrap();
+    /// let db = env.open_db(None).unwrap();
+    /// let mut txn = env.begin_rw_txn(None).unwrap();
+    /// txn.put(db, b"key", b"val", WriteFlags::empty()).unwrap();
+    ///
+    /// let cursor = txn.open_rw_cursor(db).unwrap();
+    /// let iter = cursor.into_iter_start();
+    /// // Rejected: the iterator's state is private, so the cursor cannot be
+    /// // destructured out to sidestep the read-only restriction.
+    /// match iter {
+    ///     lmdb::Iter::Ok { cursor, .. } => { let _ = cursor; },
+    ///     _ => {},
+    /// }
+    /// ```
+    pub fn into_cursor(self) -> Result<RoCursor<'txn>> {
+        match self.inner {
+            IterInner::Err(err) => Err(err),
+            IterInner::Ok {
                 cursor,
                 op: _,
                 next_op: _,
                 _marker,
             } => Ok(cursor),
-            Iter::Empty => Err(Error::NotFound),
         }
     }
 }
@@ -338,8 +554,8 @@ impl<'txn, C: Cursor<'txn>> Iterator for Iter<'txn, C> {
     type Item = Result<(&'txn [u8], &'txn [u8])>;
 
     fn next(&mut self) -> Option<Result<(&'txn [u8], &'txn [u8])>> {
-        match *self {
-            Iter::Ok {
+        match self.inner {
+            IterInner::Ok {
                 ref cursor,
                 ref mut op,
                 next_op,
@@ -364,8 +580,7 @@ impl<'txn, C: Cursor<'txn>> Iterator for Iter<'txn, C> {
                     }
                 }
             },
-            Iter::Err(err) => Some(Err(err)),
-            Iter::Empty => None,
+            IterInner::Err(err) => Some(Err(err)),
         }
     }
 }
@@ -711,7 +926,10 @@ mod test {
 
         // This key slice borrows from the memory map: its pointer is the
         // stored key's address, the natural newest-first pagination pattern.
-        let (borrowed, _) = txn.open_ro_cursor(db).unwrap().get(Some(b"key2"), None, MDB_SET_KEY).unwrap();
+        // The slice borrows the source cursor, so the cursor is kept in a local
+        // for as long as the slice is used.
+        let seek_cursor = txn.open_ro_cursor(db).unwrap();
+        let (borrowed, _) = seek_cursor.get(Some(b"key2"), None, MDB_SET_KEY).unwrap();
         let borrowed = borrowed.unwrap();
 
         let out = txn.open_ro_cursor(db).unwrap().into_iter_from_rev(borrowed).collect::<Result<Vec<_>>>().unwrap();
@@ -739,8 +957,10 @@ mod test {
 
         // Borrow "key2" from the map, then take its 3-byte prefix "key". The
         // prefix still aliases the map, but the true landing is the greater
-        // key "key2", which must be excluded.
-        let (k2, _) = txn.open_ro_cursor(db).unwrap().get(Some(b"key2"), None, MDB_SET_KEY).unwrap();
+        // key "key2", which must be excluded. The slice borrows the source
+        // cursor, so the cursor is kept in a local for as long as it is used.
+        let seek_cursor = txn.open_ro_cursor(db).unwrap();
+        let (k2, _) = seek_cursor.get(Some(b"key2"), None, MDB_SET_KEY).unwrap();
         let prefix = &k2.unwrap()[..3];
 
         let out = txn.open_ro_cursor(db).unwrap().into_iter_from_rev(prefix).collect::<Result<Vec<_>>>().unwrap();
@@ -1115,5 +1335,324 @@ mod test {
 
         cursor.del(WriteFlags::empty()).unwrap();
         assert_eq!((Some(&b"key2"[..]), &b"val2"[..]), cursor.get(None, None, MDB_LAST).unwrap());
+    }
+
+    #[test]
+    fn test_rw_cursor_walk_fixed() {
+        let dir = TempDir::new("test").unwrap();
+        let env = Environment::new().open(dir.path()).unwrap();
+        let db = env.open_db(None).unwrap();
+
+        let mut txn = env.begin_rw_txn(None).unwrap();
+        txn.put(db, b"key1", b"val1", WriteFlags::empty()).unwrap();
+        txn.put(db, b"key2", b"val2", WriteFlags::empty()).unwrap();
+        txn.put(db, b"key3", b"val3", WriteFlags::empty()).unwrap();
+
+        let cursor = txn.open_rw_cursor(db).unwrap();
+
+        // An unpositioned cursor starts the forward walk at the first item.
+        assert_eq!(Some((&b"key1"[..], &b"val1"[..])), cursor.next().unwrap());
+        assert_eq!(Some((&b"key2"[..], &b"val2"[..])), cursor.next().unwrap());
+        assert_eq!(Some((&b"key3"[..], &b"val3"[..])), cursor.next().unwrap());
+        assert_eq!(None, cursor.next().unwrap());
+
+        assert_eq!(Some((&b"key1"[..], &b"val1"[..])), cursor.first().unwrap());
+        assert_eq!(Some((&b"key3"[..], &b"val3"[..])), cursor.last().unwrap());
+
+        assert_eq!(Some((&b"key2"[..], &b"val2"[..])), cursor.prev().unwrap());
+        assert_eq!(Some((&b"key1"[..], &b"val1"[..])), cursor.prev().unwrap());
+        assert_eq!(None, cursor.prev().unwrap());
+
+        // Moving is not an update operation, so items from separate positioning
+        // calls coexist. That is what the shared borrow buys.
+        let first = cursor.first().unwrap().unwrap();
+        let second = cursor.next().unwrap().unwrap();
+        assert_eq!((&b"key1"[..], &b"val1"[..]), first);
+        assert_eq!((&b"key2"[..], &b"val2"[..]), second);
+    }
+
+    #[test]
+    fn test_rw_cursor_walk_empty_database() {
+        let dir = TempDir::new("test").unwrap();
+        let env = Environment::new().open(dir.path()).unwrap();
+        let db = env.open_db(None).unwrap();
+
+        let mut txn = env.begin_rw_txn(None).unwrap();
+        let cursor = txn.open_rw_cursor(db).unwrap();
+
+        // An empty database ends the walk rather than erroring.
+        assert_eq!(None, cursor.first().unwrap());
+        assert_eq!(None, cursor.last().unwrap());
+        assert_eq!(None, cursor.next().unwrap());
+        assert_eq!(None, cursor.prev().unwrap());
+    }
+
+    #[test]
+    fn test_rw_cursor_walk_dup() {
+        let dir = TempDir::new("test").unwrap();
+        let env = Environment::new().open(dir.path()).unwrap();
+        let db = env.create_db(None, DatabaseFlags::DUP_SORT).unwrap();
+
+        let items: Vec<(&[u8], &[u8])> =
+            vec![(b"a", b"1"), (b"a", b"2"), (b"a", b"3"), (b"b", b"1"), (b"b", b"2"), (b"b", b"3")];
+
+        let mut txn = env.begin_rw_txn(None).unwrap();
+        for (key, data) in &items {
+            txn.put(db, key, data, WriteFlags::empty()).unwrap();
+        }
+
+        let cursor = txn.open_rw_cursor(db).unwrap();
+        let expected: Vec<(Vec<u8>, Vec<u8>)> = items.iter().map(|(key, data)| (key.to_vec(), data.to_vec())).collect();
+
+        // Every duplicate of a key is walked before crossing to the next key.
+        let mut forward: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut step = cursor.first().unwrap();
+        while let Some((key, data)) = step {
+            forward.push((key.to_vec(), data.to_vec()));
+            step = cursor.next().unwrap();
+        }
+        assert_eq!(expected, forward);
+
+        let mut backward: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut step = cursor.last().unwrap();
+        while let Some((key, data)) = step {
+            backward.push((key.to_vec(), data.to_vec()));
+            step = cursor.prev().unwrap();
+        }
+        assert_eq!(expected.iter().rev().cloned().collect::<Vec<_>>(), backward);
+    }
+
+    #[test]
+    fn test_rw_cursor_walk_and_delete() {
+        let dir = TempDir::new("test").unwrap();
+        let env = Environment::new().open(dir.path()).unwrap();
+        let db = env.open_db(None).unwrap();
+
+        let items: Vec<(&[u8], &[u8])> =
+            vec![(b"key1", b"val1"), (b"key2", b"val2"), (b"key3", b"val3"), (b"key4", b"val4"), (b"key5", b"val5")];
+
+        let mut txn = env.begin_rw_txn(None).unwrap();
+        for (key, data) in &items {
+            txn.put(db, key, data, WriteFlags::empty()).unwrap();
+        }
+
+        // Decide while the item is borrowed, then mutate. The borrow ends at the
+        // last use of the item, which is what lets `del` take `&mut` next.
+        // Holding the item across the `del` is rejected instead.
+        {
+            let mut cursor = txn.open_rw_cursor(db).unwrap();
+            while let Some((key, data)) = cursor.next().unwrap() {
+                let doomed = key == &b"key2"[..] || data == &b"val4"[..];
+                if doomed {
+                    cursor.del(WriteFlags::empty()).unwrap();
+                }
+            }
+        }
+
+        // Exactly the matching entries are gone; the rest are untouched.
+        let remaining = txn.open_ro_cursor(db).unwrap().into_iter_start().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(vec![items[0], items[2], items[4]], remaining);
+    }
+
+    #[test]
+    fn test_rw_cursor_next_after_del_does_not_skip() {
+        let dir = TempDir::new("test").unwrap();
+        let env = Environment::new().open(dir.path()).unwrap();
+        let db = env.open_db(None).unwrap();
+
+        let items: Vec<(&[u8], &[u8])> =
+            vec![(b"key1", b"val1"), (b"key2", b"val2"), (b"key3", b"val3"), (b"key4", b"val4"), (b"key5", b"val5")];
+
+        let mut txn = env.begin_rw_txn(None).unwrap();
+        for (key, data) in &items {
+            txn.put(db, key, data, WriteFlags::empty()).unwrap();
+        }
+
+        let mut visited: Vec<Vec<u8>> = Vec::new();
+        {
+            let mut cursor = txn.open_rw_cursor(db).unwrap();
+            while let Some((key, _data)) = cursor.next().unwrap() {
+                visited.push(key.to_vec());
+                let doomed = key == &b"key3"[..];
+                if doomed {
+                    cursor.del(WriteFlags::empty()).unwrap();
+                }
+            }
+        }
+
+        // Deleting key3 must not make the following next() skip key4: once
+        // key3's slot is closed up the cursor already denotes key4. A vendored
+        // LMDB that dropped that behavior would show up here as a missing key4.
+        let expected_visited: Vec<Vec<u8>> = items.iter().map(|(key, _data)| key.to_vec()).collect();
+        assert_eq!(expected_visited, visited);
+
+        let remaining = txn.open_ro_cursor(db).unwrap().into_iter_start().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(vec![items[0], items[1], items[3], items[4]], remaining);
+    }
+
+    #[test]
+    fn test_rw_cursor_walk_and_delete_dup() {
+        let dir = TempDir::new("test").unwrap();
+        let env = Environment::new().open(dir.path()).unwrap();
+        let db = env.create_db(None, DatabaseFlags::DUP_SORT).unwrap();
+
+        let items: Vec<(&[u8], &[u8])> =
+            vec![(b"a", b"1"), (b"a", b"2"), (b"a", b"3"), (b"b", b"1"), (b"b", b"2"), (b"b", b"3")];
+
+        let mut txn = env.begin_rw_txn(None).unwrap();
+        for (key, data) in &items {
+            txn.put(db, key, data, WriteFlags::empty()).unwrap();
+        }
+
+        let mut visited: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        {
+            let mut cursor = txn.open_rw_cursor(db).unwrap();
+            while let Some((key, data)) = cursor.next().unwrap() {
+                visited.push((key.to_vec(), data.to_vec()));
+                let doomed = data == &b"2"[..];
+                if doomed {
+                    cursor.del(WriteFlags::empty()).unwrap();
+                }
+            }
+        }
+
+        // Deleting a duplicate must not cost the visit of the one after it,
+        // which exercises the same position contract inside a duplicate run.
+        let expected_visited: Vec<(Vec<u8>, Vec<u8>)> =
+            items.iter().map(|(key, data)| (key.to_vec(), data.to_vec())).collect();
+        assert_eq!(expected_visited, visited);
+
+        let remaining = txn.open_ro_cursor(db).unwrap().into_iter_start().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(vec![items[0], items[2], items[3], items[5]], remaining);
+    }
+
+    #[test]
+    fn test_rw_cursor_walk_and_delete_randomized() {
+        // Seed is printed so a failing run can be replayed by hardcoding it.
+        let seed: u64 = rand::random();
+        println!("test_rw_cursor_walk_and_delete_randomized seed: {}", seed);
+        // Replaying a hardcoded seed is valid only while rand stays pinned to
+        // 0.8; StdRng's algorithm is not stable across rand major versions.
+        let mut rng = StdRng::seed_from_u64(seed);
+
+        let dir = TempDir::new("test").unwrap();
+        let env = Environment::new().open(dir.path()).unwrap();
+        let db = env.open_db(None).unwrap();
+
+        // The oracle orders byte keys the same way LMDB's default comparator
+        // does: lexicographic, with a shorter prefix sorting first.
+        let mut oracle: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+
+        let mut txn = env.begin_rw_txn(None).unwrap();
+        let count: usize = rng.gen_range(1..=400);
+        for _ in 0..count {
+            let key: Vec<u8> = (0..rng.gen_range(1..=32)).map(|_| rng.gen()).collect();
+            let value: Vec<u8> = (0..rng.gen_range(0..=16)).map(|_| rng.gen()).collect();
+            txn.put(db, &key, &value, WriteFlags::empty()).unwrap();
+            oracle.insert(key, value);
+        }
+
+        // A random threshold on the key's first byte drives the deletions, so a
+        // run covers lone deletes, runs of consecutive deletes, and deletes at
+        // either end.
+        let threshold: u8 = rng.gen();
+        let doomed = |key: &[u8]| match key.first() {
+            Some(byte) => *byte < threshold,
+            None => false,
+        };
+
+        let mut visited: Vec<Vec<u8>> = Vec::new();
+        {
+            let mut cursor = txn.open_rw_cursor(db).unwrap();
+            while let Some((key, _data)) = cursor.next().unwrap() {
+                visited.push(key.to_vec());
+                if doomed(key) {
+                    cursor.del(WriteFlags::empty()).unwrap();
+                }
+            }
+        }
+
+        // No delete may cost a visit: every stored key is seen exactly once, in
+        // order, however the deletions fall.
+        let expected_visited: Vec<Vec<u8>> = oracle.keys().cloned().collect();
+        assert_eq!(expected_visited, visited, "seed {}", seed);
+
+        oracle.retain(|key, _value| !doomed(key));
+
+        let remaining = txn.open_ro_cursor(db).unwrap().into_iter_start().collect::<Result<Vec<_>>>().unwrap();
+        let expected: Vec<(&[u8], &[u8])> =
+            oracle.iter().map(|(key, value)| (key.as_slice(), value.as_slice())).collect();
+        assert_eq!(expected, remaining, "seed {}", seed);
+    }
+
+    #[test]
+    fn test_rw_cursor_walk_and_delete_dup_randomized() {
+        // Seed is printed so a failing run can be replayed by hardcoding it.
+        let seed: u64 = rand::random();
+        println!("test_rw_cursor_walk_and_delete_dup_randomized seed: {}", seed);
+        // Replaying a hardcoded seed is valid only while rand stays pinned to
+        // 0.8; StdRng's algorithm is not stable across rand major versions.
+        let mut rng = StdRng::seed_from_u64(seed);
+
+        let dir = TempDir::new("test").unwrap();
+        let env = Environment::new().open(dir.path()).unwrap();
+        let db = env.create_db(None, DatabaseFlags::DUP_SORT).unwrap();
+
+        // - The oracle mirrors LMDB's DUP_SORT order: keys ascending, and within
+        //   a key the duplicate values ascending, both lexicographic.
+        // - A BTreeSet of values drops exact duplicates, matching a plain
+        //   DUP_SORT put that silently ignores an already-present (key, value).
+        let mut oracle: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>> = BTreeMap::new();
+
+        let mut txn = env.begin_rw_txn(None).unwrap();
+        let count: usize = rng.gen_range(1..=300);
+        for _ in 0..count {
+            // A small key alphabet piles duplicates under each key instead of
+            // making every key unique.
+            let key: Vec<u8> = vec![rng.gen_range(b'a'..=b'e')];
+            // DUP_SORT stores each duplicate value as a key in a sub-database,
+            // and LMDB rejects empty keys, so a duplicate value must be at least
+            // one byte.
+            let value: Vec<u8> = (0..rng.gen_range(1..=16)).map(|_| rng.gen()).collect();
+            txn.put(db, &key, &value, WriteFlags::empty()).unwrap();
+            oracle.entry(key).or_default().insert(value);
+        }
+
+        // The predicate reads the duplicate value, so deletions land inside a
+        // key's duplicate run as well as at its edges.
+        let threshold: u8 = rng.gen();
+        let doomed = |value: &[u8]| match value.first() {
+            Some(byte) => *byte < threshold,
+            None => false,
+        };
+
+        let mut visited: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        {
+            let mut cursor = txn.open_rw_cursor(db).unwrap();
+            while let Some((key, data)) = cursor.next().unwrap() {
+                visited.push((key.to_vec(), data.to_vec()));
+                if doomed(data) {
+                    cursor.del(WriteFlags::empty()).unwrap();
+                }
+            }
+        }
+
+        // Deleting a duplicate must not cost the visit of the one after it.
+        let expected_visited: Vec<(Vec<u8>, Vec<u8>)> = oracle
+            .iter()
+            .flat_map(|(key, values)| values.iter().map(move |value| (key.clone(), value.clone())))
+            .collect();
+        assert_eq!(expected_visited, visited, "seed {}", seed);
+
+        for values in oracle.values_mut() {
+            values.retain(|value| !doomed(value));
+        }
+
+        let remaining = txn.open_ro_cursor(db).unwrap().into_iter_start().collect::<Result<Vec<_>>>().unwrap();
+        let expected: Vec<(&[u8], &[u8])> = oracle
+            .iter()
+            .flat_map(|(key, values)| values.iter().map(move |value| (key.as_slice(), value.as_slice())))
+            .collect();
+        assert_eq!(expected, remaining, "seed {}", seed);
     }
 }
