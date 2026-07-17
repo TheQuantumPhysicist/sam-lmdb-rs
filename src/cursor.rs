@@ -71,6 +71,58 @@ pub trait Cursor<'txn>: Sized {
         Iter::new(self, ffi::MDB_GET_CURRENT, ffi::MDB_NEXT)
     }
 
+    /// Iterate over database items in reverse, starting from the end of the
+    /// database.
+    ///
+    /// - Keys are returned in descending order.
+    /// - Mirror of `into_iter_start`, with the direction reversed.
+    /// - For databases with duplicate data items (`DatabaseFlags::DUP_SORT`),
+    ///   the duplicate data items of each key are returned in reverse order
+    ///   before moving on to the previous key.
+    fn into_iter_rev(self) -> Iter<'txn, Self> {
+        Iter::new(self, ffi::MDB_LAST, ffi::MDB_PREV)
+    }
+
+    /// Iterate over database items in reverse, starting from the given key.
+    ///
+    /// - Returns items with keys less than or equal to the given key, in
+    ///   descending key order. The given key, when present, is included.
+    /// - Mirror of `into_iter_from`, with the direction reversed.
+    /// - For databases with duplicate data items (`DatabaseFlags::DUP_SORT`),
+    ///   every duplicate of the matched key is returned in reverse order
+    ///   before moving on to earlier keys, mirroring `into_iter_from`.
+    fn into_iter_from_rev<K>(self, key: K) -> Iter<'txn, Self>
+    where
+        K: AsRef<[u8]>,
+    {
+        // - LMDB's forward range-seek (MDB_SET_RANGE) does not report whether it
+        //   landed on the requested key or a greater one, and the reverse walk
+        //   needs that distinction.
+        // - MDB_SET reports an exact match directly as Ok versus NotFound, so it
+        //   drives the exact case; MDB_SET_RANGE then splits a greater key from
+        //   all-smaller for the remaining keys.
+        match self.get(Some(key.as_ref()), None, ffi::MDB_SET) {
+            Ok(_) => {
+                // - On DUP_SORT data the cursor sits on the first duplicate of
+                //   the key; move to the last so the descending walk yields every
+                //   duplicate before crossing to earlier keys.
+                // - MDB_LAST_DUP fails on a database opened without duplicate
+                //   support and leaves the cursor on the key, which is the
+                //   position wanted anyway.
+                self.get(None, None, ffi::MDB_LAST_DUP).ok();
+                Iter::new(self, ffi::MDB_GET_CURRENT, ffi::MDB_PREV)
+            },
+            Err(Error::NotFound) => match self.get(Some(key.as_ref()), None, ffi::MDB_SET_RANGE) {
+                // Landed on a greater key: step back to the nearest smaller key.
+                Ok(_) => Iter::new(self, ffi::MDB_PREV, ffi::MDB_PREV),
+                // Every key is smaller than the request: start from the last key.
+                Err(Error::NotFound) => Iter::new(self, ffi::MDB_LAST, ffi::MDB_PREV),
+                Err(error) => Iter::Err(error),
+            },
+            Err(error) => Iter::Err(error),
+        }
+    }
+
     /// Iterate over the duplicates of the item in the database with the given key.
     fn into_iter_dup_of<K>(self, key: K) -> Iter<'txn, Self>
     where
@@ -320,12 +372,14 @@ impl<'txn, C: Cursor<'txn>> Iterator for Iter<'txn, C> {
 
 #[cfg(test)]
 mod test {
-    use tempdir::TempDir;
-
     use super::*;
     use crate::environment::*;
     use crate::flags::*;
     use ffi::*;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+    use std::collections::{BTreeMap, BTreeSet};
+    use tempdir::TempDir;
 
     #[test]
     fn test_get() {
@@ -492,6 +546,8 @@ mod test {
         assert_eq!(0, txn.open_ro_cursor(db).unwrap().into_iter().count());
         assert_eq!(0, txn.open_ro_cursor(db).unwrap().into_iter_start().count());
         assert_eq!(0, txn.open_ro_cursor(db).unwrap().into_iter_from(b"foo").count());
+        assert_eq!(0, txn.open_ro_cursor(db).unwrap().into_iter_rev().count());
+        assert_eq!(0, txn.open_ro_cursor(db).unwrap().into_iter_from_rev(b"foo").count());
     }
 
     #[test]
@@ -505,6 +561,8 @@ mod test {
         assert_eq!(0, txn.open_ro_cursor(db).unwrap().into_iter_start().count());
         assert_eq!(0, txn.open_ro_cursor(db).unwrap().into_iter_from(b"foo").count());
         assert_eq!(0, txn.open_ro_cursor(db).unwrap().into_iter_dup_of(b"foo").count());
+        assert_eq!(0, txn.open_ro_cursor(db).unwrap().into_iter_rev().count());
+        assert_eq!(0, txn.open_ro_cursor(db).unwrap().into_iter_from_rev(b"foo").count());
     }
 
     #[test]
@@ -546,6 +604,461 @@ mod test {
 
         let cursor = txn.open_ro_cursor(db).unwrap();
         assert_eq!(0, cursor.into_iter_dup_of(b"foo").count());
+    }
+
+    #[test]
+    fn test_iter_rev() {
+        let dir = TempDir::new("test").unwrap();
+        let env = Environment::new().open(dir.path()).unwrap();
+        let db = env.open_db(None).unwrap();
+
+        let items: Vec<(&[u8], &[u8])> =
+            vec![(b"key1", b"val1"), (b"key2", b"val2"), (b"key3", b"val3"), (b"key5", b"val5")];
+
+        {
+            let mut txn = env.begin_rw_txn(None).unwrap();
+            for (key, data) in &items {
+                txn.put(db, key, data, WriteFlags::empty()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let txn = env.begin_ro_txn().unwrap();
+
+        let forward = txn.open_ro_cursor(db).unwrap().into_iter_start().collect::<Result<Vec<_>>>().unwrap();
+        let backward = txn.open_ro_cursor(db).unwrap().into_iter_rev().collect::<Result<Vec<_>>>().unwrap();
+
+        // Reverse-all is exactly the forward iteration reversed.
+        assert_eq!(forward.iter().rev().copied().collect::<Vec<_>>(), backward);
+        assert_eq!(items.iter().rev().copied().collect::<Vec<_>>(), backward);
+    }
+
+    #[test]
+    fn test_iter_rev_ignores_position() {
+        let dir = TempDir::new("test").unwrap();
+        let env = Environment::new().open(dir.path()).unwrap();
+        let db = env.open_db(None).unwrap();
+
+        let items: Vec<(&[u8], &[u8])> =
+            vec![(b"key1", b"val1"), (b"key2", b"val2"), (b"key3", b"val3"), (b"key5", b"val5")];
+
+        {
+            let mut txn = env.begin_rw_txn(None).unwrap();
+            for (key, data) in &items {
+                txn.put(db, key, data, WriteFlags::empty()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let txn = env.begin_ro_txn().unwrap();
+
+        let cursor = txn.open_ro_cursor(db).unwrap();
+        // Pre-seeking the cursor to a middle key must not change a full reverse scan.
+        cursor.get(Some(b"key2"), None, MDB_SET).unwrap();
+        let backward = cursor.into_iter_rev().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(items.iter().rev().copied().collect::<Vec<_>>(), backward);
+    }
+
+    #[test]
+    fn test_iter_from_rev() {
+        let dir = TempDir::new("test").unwrap();
+        let env = Environment::new().open(dir.path()).unwrap();
+        let db = env.open_db(None).unwrap();
+
+        let items: Vec<(&[u8], &[u8])> =
+            vec![(b"key1", b"val1"), (b"key2", b"val2"), (b"key3", b"val3"), (b"key5", b"val5")];
+
+        {
+            let mut txn = env.begin_rw_txn(None).unwrap();
+            for (key, data) in &items {
+                txn.put(db, key, data, WriteFlags::empty()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let txn = env.begin_ro_txn().unwrap();
+        let rev_from =
+            |key: &[u8]| txn.open_ro_cursor(db).unwrap().into_iter_from_rev(key).collect::<Result<Vec<_>>>().unwrap();
+
+        // Requested key present: included, then descending.
+        assert_eq!(vec![items[1], items[0]], rev_from(b"key2"));
+        // Requested key present and smallest: only that key.
+        assert_eq!(vec![items[0]], rev_from(b"key1"));
+        // Requested key absent inside the range: starts at the nearest smaller key.
+        assert_eq!(vec![items[2], items[1], items[0]], rev_from(b"key4"));
+        // Requested key greater than every key: full descending scan.
+        assert_eq!(vec![items[3], items[2], items[1], items[0]], rev_from(b"key6"));
+        // Requested key smaller than every key: empty.
+        assert_eq!(Vec::<(&[u8], &[u8])>::new(), rev_from(b"key0"));
+    }
+
+    #[test]
+    fn test_iter_from_rev_map_borrowed_key() {
+        let dir = TempDir::new("test").unwrap();
+        let env = Environment::new().open(dir.path()).unwrap();
+        let db = env.open_db(None).unwrap();
+
+        let items: Vec<(&[u8], &[u8])> = vec![(b"key1", b"val1"), (b"key2", b"val2"), (b"key3", b"val3")];
+        {
+            let mut txn = env.begin_rw_txn(None).unwrap();
+            for (key, data) in &items {
+                txn.put(db, key, data, WriteFlags::empty()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let txn = env.begin_ro_txn().unwrap();
+
+        // This key slice borrows from the memory map: its pointer is the
+        // stored key's address, the natural newest-first pagination pattern.
+        let (borrowed, _) = txn.open_ro_cursor(db).unwrap().get(Some(b"key2"), None, MDB_SET_KEY).unwrap();
+        let borrowed = borrowed.unwrap();
+
+        let out = txn.open_ro_cursor(db).unwrap().into_iter_from_rev(borrowed).collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(vec![items[1], items[0]], out);
+    }
+
+    #[test]
+    fn test_iter_from_rev_map_borrowed_prefix() {
+        let dir = TempDir::new("test").unwrap();
+        let env = Environment::new().open(dir.path()).unwrap();
+        let db = env.open_db(None).unwrap();
+
+        // "kex" sorts below "key"; "key" (a prefix of "key2") sorts between
+        // "kex" and "key2".
+        let items: Vec<(&[u8], &[u8])> = vec![(b"kex", b"v0"), (b"key2", b"v2"), (b"key3", b"v3")];
+        {
+            let mut txn = env.begin_rw_txn(None).unwrap();
+            for (key, data) in &items {
+                txn.put(db, key, data, WriteFlags::empty()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let txn = env.begin_ro_txn().unwrap();
+
+        // Borrow "key2" from the map, then take its 3-byte prefix "key". The
+        // prefix still aliases the map, but the true landing is the greater
+        // key "key2", which must be excluded.
+        let (k2, _) = txn.open_ro_cursor(db).unwrap().get(Some(b"key2"), None, MDB_SET_KEY).unwrap();
+        let prefix = &k2.unwrap()[..3];
+
+        let out = txn.open_ro_cursor(db).unwrap().into_iter_from_rev(prefix).collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(vec![items[0]], out);
+    }
+
+    #[test]
+    fn test_iter_from_rev_empty_key_errors() {
+        let dir = TempDir::new("test").unwrap();
+        let env = Environment::new().open(dir.path()).unwrap();
+        let db = env.open_db(None).unwrap();
+
+        let mut txn = env.begin_rw_txn(None).unwrap();
+        txn.put(db, b"key", b"val", WriteFlags::empty()).unwrap();
+        txn.commit().unwrap();
+
+        let txn = env.begin_ro_txn().unwrap();
+        // A zero-length key is rejected by LMDB (MDB_BAD_VALSIZE); the error
+        // surfaces on the first step rather than as an empty iterator.
+        let mut iter = txn.open_ro_cursor(db).unwrap().into_iter_from_rev(b"");
+        assert!(matches!(iter.next(), Some(Err(_))));
+    }
+
+    #[test]
+    fn test_iter_rev_prefix_keys() {
+        let dir = TempDir::new("test").unwrap();
+        let env = Environment::new().open(dir.path()).unwrap();
+        let db = env.open_db(None).unwrap();
+
+        // - Keys where one is a byte-prefix of another.
+        // - LMDB's default order puts the shorter key first.
+        let items: Vec<(&[u8], &[u8])> =
+            vec![(&[0x00], b"a"), (&[0x00, 0x00], b"b"), (&[0x00, 0x00, 0x00], b"c"), (&[0x01], b"d")];
+
+        {
+            let mut txn = env.begin_rw_txn(None).unwrap();
+            for (key, data) in &items {
+                txn.put(db, key, data, WriteFlags::empty()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let txn = env.begin_ro_txn().unwrap();
+
+        let backward = txn.open_ro_cursor(db).unwrap().into_iter_rev().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(items.iter().rev().copied().collect::<Vec<_>>(), backward);
+
+        let rev_from =
+            |key: &[u8]| txn.open_ro_cursor(db).unwrap().into_iter_from_rev(key).collect::<Result<Vec<_>>>().unwrap();
+
+        // Exact prefix key: its longer extensions are excluded.
+        assert_eq!(vec![items[1], items[0]], rev_from(&[0x00, 0x00]));
+        // Absent key inside the prefix chain: starts below it.
+        assert_eq!(vec![items[2], items[1], items[0]], rev_from(&[0x00, 0x00, 0x01]));
+        // Exact smallest key: only itself.
+        assert_eq!(vec![items[0]], rev_from(&[0x00]));
+    }
+
+    #[test]
+    fn test_iter_rev_single_key() {
+        let dir = TempDir::new("test").unwrap();
+        let env = Environment::new().open(dir.path()).unwrap();
+        let db = env.open_db(None).unwrap();
+
+        let mut txn = env.begin_rw_txn(None).unwrap();
+        txn.put(db, b"key", b"val", WriteFlags::empty()).unwrap();
+        txn.commit().unwrap();
+
+        let txn = env.begin_ro_txn().unwrap();
+        let expected: Vec<(&[u8], &[u8])> = vec![(b"key", b"val")];
+
+        assert_eq!(expected, txn.open_ro_cursor(db).unwrap().into_iter_rev().collect::<Result<Vec<_>>>().unwrap());
+        assert_eq!(
+            expected,
+            txn.open_ro_cursor(db).unwrap().into_iter_from_rev(b"key").collect::<Result<Vec<_>>>().unwrap()
+        );
+        // A request above the only key still finds it.
+        assert_eq!(
+            expected,
+            txn.open_ro_cursor(db).unwrap().into_iter_from_rev(b"kez").collect::<Result<Vec<_>>>().unwrap()
+        );
+        // A request below the only key finds nothing.
+        assert_eq!(0, txn.open_ro_cursor(db).unwrap().into_iter_from_rev(b"kex").count());
+    }
+
+    #[test]
+    fn test_iter_rev_dup() {
+        let dir = TempDir::new("test").unwrap();
+        let env = Environment::new().open(dir.path()).unwrap();
+        let db = env.create_db(None, DatabaseFlags::DUP_SORT).unwrap();
+
+        let items: Vec<(&[u8], &[u8])> =
+            vec![(b"a", b"1"), (b"a", b"2"), (b"a", b"3"), (b"b", b"1"), (b"b", b"2"), (b"b", b"3")];
+
+        {
+            let mut txn = env.begin_rw_txn(None).unwrap();
+            for (key, data) in &items {
+                txn.put(db, key, data, WriteFlags::empty()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let txn = env.begin_ro_txn().unwrap();
+
+        // Reverse-all mirrors the forward iteration exactly, duplicates included.
+        let backward = txn.open_ro_cursor(db).unwrap().into_iter_rev().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(items.iter().rev().copied().collect::<Vec<_>>(), backward);
+
+        // Exact hit now yields every duplicate of the matched key, descending,
+        // before crossing to earlier keys.
+        let from_b = txn.open_ro_cursor(db).unwrap().into_iter_from_rev(b"b").collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(
+            vec![(&b"b"[..], &b"3"[..]), (b"b", b"2"), (b"b", b"1"), (b"a", b"3"), (b"a", b"2"), (b"a", b"1")],
+            from_b
+        );
+
+        // A key greater than all keys seeds MDB_LAST and yields the same set.
+        let from_c = txn.open_ro_cursor(db).unwrap().into_iter_from_rev(b"c").collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(from_b, from_c);
+
+        // Absent key between a and b: a's duplicates only.
+        let from_ab = txn.open_ro_cursor(db).unwrap().into_iter_from_rev(b"ab").collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(vec![(&b"a"[..], &b"3"[..]), (b"a", b"2"), (b"a", b"1")], from_ab);
+
+        // A key below all keys: empty.
+        assert_eq!(0, txn.open_ro_cursor(db).unwrap().into_iter_from_rev(b"0").count());
+    }
+
+    #[test]
+    fn test_iter_from_rev_dup_middle_key() {
+        let dir = TempDir::new("test").unwrap();
+        let env = Environment::new().open(dir.path()).unwrap();
+        let db = env.create_db(None, DatabaseFlags::DUP_SORT).unwrap();
+
+        let items: Vec<(&[u8], &[u8])> = vec![
+            (b"a", b"1"),
+            (b"a", b"2"),
+            (b"a", b"3"),
+            (b"b", b"1"),
+            (b"b", b"2"),
+            (b"b", b"3"),
+            (b"c", b"1"),
+            (b"c", b"2"),
+            (b"c", b"3"),
+        ];
+        {
+            let mut txn = env.begin_rw_txn(None).unwrap();
+            for (key, data) in &items {
+                txn.put(db, key, data, WriteFlags::empty()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let txn = env.begin_ro_txn().unwrap();
+
+        // Exact hit on the middle key "b" yields all of b's duplicates
+        // descending, then a's; "c" and its duplicates are excluded.
+        let from_b = txn.open_ro_cursor(db).unwrap().into_iter_from_rev(b"b").collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(
+            vec![(&b"b"[..], &b"3"[..]), (b"b", b"2"), (b"b", b"1"), (b"a", b"3"), (b"a", b"2"), (b"a", b"1")],
+            from_b
+        );
+
+        // Exact hit on the smallest key "a" yields only a's duplicates, then
+        // the descending walk underflows to an empty result.
+        let from_a = txn.open_ro_cursor(db).unwrap().into_iter_from_rev(b"a").collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(vec![(&b"a"[..], &b"3"[..]), (b"a", b"2"), (b"a", b"1")], from_a);
+    }
+
+    #[test]
+    fn test_iter_from_rev_dup_subdata_spill() {
+        let dir = TempDir::new("test").unwrap();
+        let env = Environment::new().open(dir.path()).unwrap();
+        let db = env.create_db(None, DatabaseFlags::DUP_SORT).unwrap();
+
+        // - Roughly 2000 eight-byte duplicates under one key dwarf the node
+        //   size limit and force the duplicates into a separate sub-database
+        //   (F_SUBDATA) rather than an inline sub-page.
+        // - A neighbor key verifies the descending walk crosses out of the
+        //   sub-database back into the main database.
+        let b_vals: Vec<[u8; 8]> = (0u64..2000).map(u64::to_be_bytes).collect();
+        let a_vals: Vec<[u8; 8]> = vec![1u64.to_be_bytes(), 2u64.to_be_bytes()];
+        {
+            let mut txn = env.begin_rw_txn(None).unwrap();
+            for v in &a_vals {
+                txn.put(db, b"a", v, WriteFlags::empty()).unwrap();
+            }
+            for v in &b_vals {
+                txn.put(db, b"b", v, WriteFlags::empty()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let txn = env.begin_ro_txn().unwrap();
+
+        let mut expected: Vec<(&[u8], &[u8])> = Vec::new();
+        for v in b_vals.iter().rev() {
+            expected.push((b"b", &v[..]));
+        }
+        for v in a_vals.iter().rev() {
+            expected.push((b"a", &v[..]));
+        }
+
+        let from_b = txn.open_ro_cursor(db).unwrap().into_iter_from_rev(b"b").collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(expected, from_b);
+
+        let full = txn.open_ro_cursor(db).unwrap().into_iter_rev().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(expected, full);
+    }
+
+    #[test]
+    fn test_iter_rev_randomized() {
+        // Seed is printed so a failing run can be replayed by hardcoding it.
+        let seed: u64 = rand::random();
+        println!("test_iter_rev_randomized seed: {}", seed);
+        // Replaying a hardcoded seed is valid only while rand stays pinned to
+        // 0.8; StdRng's algorithm is not stable across rand major versions.
+        let mut rng = StdRng::seed_from_u64(seed);
+
+        let dir = TempDir::new("test").unwrap();
+        let env = Environment::new().open(dir.path()).unwrap();
+        let db = env.open_db(None).unwrap();
+
+        // The oracle orders byte keys the same way LMDB's default comparator
+        // does: lexicographic, with a shorter prefix sorting first.
+        let mut oracle: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+
+        let mut txn = env.begin_rw_txn(None).unwrap();
+        for _ in 0..500 {
+            let key: Vec<u8> = (0..rng.gen_range(1..=32)).map(|_| rng.gen()).collect();
+            let value: Vec<u8> = (0..rng.gen_range(0..=16)).map(|_| rng.gen()).collect();
+            txn.put(db, &key, &value, WriteFlags::empty()).unwrap();
+            oracle.insert(key, value);
+        }
+        txn.commit().unwrap();
+
+        let txn = env.begin_ro_txn().unwrap();
+
+        let expected: Vec<(&[u8], &[u8])> =
+            oracle.iter().rev().map(|(key, value)| (key.as_slice(), value.as_slice())).collect();
+        let backward = txn.open_ro_cursor(db).unwrap().into_iter_rev().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(expected, backward, "seed {}", seed);
+
+        // Random probes: half drawn from present keys, half fresh and mostly absent.
+        for _ in 0..64 {
+            let probe: Vec<u8> = if rng.gen_bool(0.5) {
+                let index = rng.gen_range(0..oracle.len());
+                oracle.keys().nth(index).unwrap().clone()
+            } else {
+                (0..rng.gen_range(1..=32)).map(|_| rng.gen()).collect()
+            };
+            let expected: Vec<(&[u8], &[u8])> =
+                oracle.range(..=probe.clone()).rev().map(|(key, value)| (key.as_slice(), value.as_slice())).collect();
+            let actual =
+                txn.open_ro_cursor(db).unwrap().into_iter_from_rev(&probe).collect::<Result<Vec<_>>>().unwrap();
+            assert_eq!(expected, actual, "seed {} probe {:?}", seed, probe);
+        }
+    }
+
+    #[test]
+    fn test_iter_rev_dup_randomized() {
+        // Seed is printed so a failing run can be replayed by hardcoding it.
+        let seed: u64 = rand::random();
+        println!("test_iter_rev_dup_randomized seed: {}", seed);
+        // Replaying a hardcoded seed is valid only while rand stays pinned to
+        // 0.8; StdRng's algorithm is not stable across rand major versions.
+        let mut rng = StdRng::seed_from_u64(seed);
+
+        let dir = TempDir::new("test").unwrap();
+        let env = Environment::new().open(dir.path()).unwrap();
+        let db = env.create_db(None, DatabaseFlags::DUP_SORT).unwrap();
+
+        // - The oracle mirrors LMDB's DUP_SORT order: keys ascending, and within
+        //   a key the duplicate values ascending, both lexicographic.
+        // - A BTreeSet of values drops exact duplicates, matching a plain
+        //   DUP_SORT put that silently ignores an already-present (key, value).
+        let mut oracle: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>> = BTreeMap::new();
+
+        let mut txn = env.begin_rw_txn(None).unwrap();
+        for _ in 0..300 {
+            let key: Vec<u8> = (0..rng.gen_range(1..=32)).map(|_| rng.gen()).collect();
+            // DUP_SORT stores each duplicate value as a key in a sub-database,
+            // and LMDB rejects empty keys, so a duplicate value must be at least
+            // one byte. Zero-length values cannot round-trip here.
+            let value: Vec<u8> = (0..rng.gen_range(1..=16)).map(|_| rng.gen()).collect();
+            txn.put(db, &key, &value, WriteFlags::empty()).unwrap();
+            oracle.entry(key).or_default().insert(value);
+        }
+        txn.commit().unwrap();
+
+        let txn = env.begin_ro_txn().unwrap();
+
+        // Full reverse: each key descending, and within a key each duplicate
+        // value descending.
+        let expected: Vec<(&[u8], &[u8])> = oracle
+            .iter()
+            .rev()
+            .flat_map(|(key, values)| values.iter().rev().map(move |value| (key.as_slice(), value.as_slice())))
+            .collect();
+        let backward = txn.open_ro_cursor(db).unwrap().into_iter_rev().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(expected, backward, "seed {}", seed);
+
+        // Random probes: half drawn from present keys, half fresh and mostly absent.
+        for _ in 0..32 {
+            let probe: Vec<u8> = if rng.gen_bool(0.5) {
+                let index = rng.gen_range(0..oracle.len());
+                oracle.keys().nth(index).unwrap().clone()
+            } else {
+                (0..rng.gen_range(1..=32)).map(|_| rng.gen()).collect()
+            };
+            let expected: Vec<(&[u8], &[u8])> = oracle
+                .range(..=probe.clone())
+                .rev()
+                .flat_map(|(key, values)| values.iter().rev().map(move |value| (key.as_slice(), value.as_slice())))
+                .collect();
+            let actual =
+                txn.open_ro_cursor(db).unwrap().into_iter_from_rev(&probe).collect::<Result<Vec<_>>>().unwrap();
+            assert_eq!(expected, actual, "seed {} probe {:?}", seed, probe);
+        }
     }
 
     #[test]
